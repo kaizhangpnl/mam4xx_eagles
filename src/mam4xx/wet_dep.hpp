@@ -52,6 +52,42 @@ using View2D = DeviceType::view_2d<Real>;
 using View2DHost = typename HostType::view_2d<Real>;
 
 
+//=============================================================================
+// FUNCTION: local_precip_production
+//=============================================================================
+// Description: Calculates the local precipitation production/loss rate
+//              by converting mass mixing ratio tendencies to mass flux.
+//
+// Physical Background:
+//   Precipitation within an atmospheric layer results from the balance of:
+//   - Source terms: Condensation, autoconversion, accretion
+//   - Sink terms: Evaporation, sublimation
+//   
+//   The net precipitation rate is converted from mixing ratio tendency
+//   to mass flux using the hydrostatic relationship:
+//     mass_flux = (Δp / g) × (source - sink)
+//
+// Formula:
+//   result = (pdel / gravity) × (source_term - sink_term)
+//
+// Parameters:
+//   pdel        [in]  - Pressure thickness of the layer [Pa]
+//   source_term [in]  - Precipitation source rate (production) [kg/kg/s]
+//   sink_term   [in]  - Precipitation sink rate (evaporation) [kg/kg/s]
+//   gravity     [in]  - Gravitational acceleration [m/s²]
+//   result      [out] - Net precipitation mass flux [kg/m²/s]
+//
+// Sign Convention:
+//   - Positive result: Net precipitation production (rain forming)
+//   - Negative result: Net precipitation loss (evaporation exceeds production)
+//
+// Usage Context:
+//   Used in wet deposition calculations to determine:
+//   - rprddpsum: Deep convective precipitation production
+//   - rprdshsum: Shallow convective precipitation production  
+//   - evapcdpsum: Deep convective precipitation evaporation
+//   - evapcshsum: Shallow convective precipitation evaporation
+//=============================================================================
 KOKKOS_INLINE_FUNCTION
 void local_precip_production(Real pdel, Real source_term, Real sink_term,
                              Real gravity, Real &result) {
@@ -59,10 +95,71 @@ void local_precip_production(Real pdel, Real source_term, Real sink_term,
   result = r;
 }
 
-// Function to call to initialize the arrays passe to the
-// aero_model_wetdep function.
-// this is host function, scavimptblvol and  scavimptblnum need to be sycn to
-// device.
+
+//=============================================================================
+//
+//   By pre-computing rates across the range of growth factors, we avoid
+//   expensive calculations during model timestepping.
+//
+// Mode-Density Assignments:
+//   ┌─────────────────┬───────────────────┬─────────────────────────────────┐
+//   │ Mode            │ Reference Species │ Rationale                       │
+//   ├─────────────────┼───────────────────┼─────────────────────────────────┤
+//   │ 0: Accumulation │ Sulfate (SO4)     │ Sulfate dominates mass          │
+//   │ 1: Aitken       │ Sulfate (SO4)     │ Nucleation-mode sulfate         │
+//   │ 2: Coarse       │ Dust (DST)        │ Dust dominates coarse mass      │
+//   │ 3: PrimaryCarbon│ POM               │ Organic matter + black carbon   │
+//   └─────────────────┴───────────────────┴─────────────────────────────────┘
+//
+// Lookup Table Structure:
+//   - Dimensions: [nimptblgrow_total][num_modes] = [20][4]
+//   - First index: Hygroscopic growth level (-7 to +12, mapped to 0-19)
+//   - Second index: Aerosol mode (0-3)
+//   - Values: log(scavenging_rate) for linear interpolation in log-space
+//
+// Parameters:
+//   scavimptblvol [out] - Lookup table for volume scavenging rates [log(1/hr)]
+//   scavimptblnum [out] - Lookup table for number scavenging rates [log(1/hr)]
+//
+// IMPORTANT: Host-Device Synchronization
+//   This function runs on the HOST (CPU) and populates View2DHost arrays.
+//   After calling this function, the data must be copied to device memory:
+//     Kokkos::deep_copy(scavimptblvol_device, scavimptblvol);
+//     Kokkos::deep_copy(scavimptblnum_device, scavimptblnum);
+//
+// Usage Example:
+//   // During model initialization (host code):
+//   View2DHost scavimptblvol_h("scavimptblvol", nimptblgrow_total, num_modes);
+//   View2DHost scavimptblnum_h("scavimptblnum", nimptblgrow_total, num_modes);
+//   init_scavimptbl(scavimptblvol_h, scavimptblnum_h);
+//   
+//   // Copy to device:
+//   View2D scavimptblvol_d("scavimptblvol_d", nimptblgrow_total, num_modes);
+//   View2D scavimptblnum_d("scavimptblnum_d", nimptblgrow_total, num_modes);
+//   Kokkos::deep_copy(scavimptblvol_d, scavimptblvol_h);
+//   Kokkos::deep_copy(scavimptblnum_d, scavimptblnum_h);
+//
+// Performance Notes:
+//   - Called once during initialization (not performance-critical)
+//   - Internally calls modal_aero_bcscavcoef_init() which is expensive
+//     (~20-40 million cycles due to nested integration loops)
+//   - Total tables: 20 growth levels × 4 modes = 80 entries
+//
+// Suggestions for Improvement:
+//   1. Fix typo in comment: "passe" → "passed", "sycn" → "sync"
+//   2. Add documentation for required View2DHost dimensions
+//   3. Consider adding validation that views have correct dimensions
+//   4. Document density values used for each mode
+//
+// Dependencies:
+//   - modes(): Provides mode size parameters (nom_diameter, mean_std_dev)
+//   - mam4_density_so4, mam4_density_dst, mam4_density_pom: Species densities
+//   - modal_aero_bcscavcoef_init(): Performs the actual table computation
+//
+// Related Functions:
+//   - modal_aero_bcscavcoef_init(): Called to compute table values
+//   - modal_aero_bcscavcoef_get(): Runtime lookup using these tables
+//=============================================================================
 inline void init_scavimptbl(View2DHost scavimptblvol,
                             View2DHost scavimptblnum) {
   const int num_modes = AeroConfig::num_modes();
@@ -83,6 +180,58 @@ inline void init_scavimptbl(View2DHost scavimptblvol,
                                          aerosol_dry_density, scavimptblnum,
                                          scavimptblvol);
 }
+
+//=============================================================================
+// FUNCTION: calculate_cloudy_volume
+//=============================================================================
+// Description: Calculates the fractional volume of the atmosphere that is
+//              "cloudy" for wet scavenging purposes at each vertical level.
+//              This accounts for both local cloud fraction and the vertical
+//              coherence of precipitating cloud columns above.
+//
+// Physical Background:
+//   Wet scavenging occurs within cloudy regions where precipitation forms
+//   and falls. The "cloudy volume" at each level represents the fraction
+//   of the grid cell where scavenging can occur, considering:
+//   
+//   1. Local cloud fraction (cld): Horizontal extent of clouds at this level
+//   2. Precipitating column above: Vertical coherence of precipitation
+//   
+//   The algorithm tracks precipitation-weighted cloud fraction from above,
+//   ensuring that scavenging is applied consistently through the column
+//   where precipitation is falling.
+//
+// Algorithm:
+//   The cloudy volume at level i is computed as:
+//   
+//   1. Calculate "clouds" = precipitation-weighted mean cloud fraction
+//      from all levels above, weighted by precipitation production:
+//      
+//      clouds = min(1, Σ(cld_j × prec_j) / Σ(prec_j⁺)) × (Σprec_j / Σprec_j⁺)
+//      
+//      where prec_j⁺ = max(prec_j, small_value)
+//   
+//   2. Apply mode-specific logic:
+//      - is_tot_cld = true:  cldv[i] = max(clouds, cld[i])
+//        → Use larger of inherited cloud or local cloud
+//      - is_tot_cld = false: cldv[i] = max(clouds, 0.0)
+//        → Only use inherited cloud from above (convective/stratiform split)
+//   
+//   3. Update accumulators for next level:
+//      - Add current level's precipitation-weighted cloud fraction
+//      - Add current level's precipitation to running sums
+//
+// Parameters:
+//   nlev       [in]  - Number of vertical levels
+//   cld        [in]  - Cloud fraction at each level [fraction, 0-1]
+//   lprec      [in]  - Functor/lambda returning local precipitation rate [kg/m²/s]
+//                      Called as: lprec(i) for level i
+//   is_tot_cld [in]  - Flag controlling cloudy volume calculation mode:
+//                      true  = Total cloud (use max of local and inherited)
+//                      false = Convective/stratiform (inherited only)
+//   cldv       [out] - Cloudy volume fraction at each level [fraction, 0-1]
+//
+//=============================================================================
 
 // clang-format off
 /**
@@ -144,7 +293,108 @@ calculate_cloudy_volume(const int nlev, const Real cld[/*nlev*/], FUNC lprec,
   }
 }
 
-// ==============================================================================
+
+//=============================================================================
+// FUNCTION: update_scavenging
+//=============================================================================
+// Description: Updates all scavenging tendency components for aerosol wet
+//              removal at a single grid point (icol, kk). Computes in-cloud,
+//              below-cloud, and resuspension tendencies separately for
+//              stratiform and convective precipitation.
+//
+// Physical Background:
+//   Wet scavenging removes aerosols through multiple mechanisms:
+//   
+//   1. IN-CLOUD SCAVENGING (nucleation scavenging):
+//      - Aerosols serve as CCN, incorporated into cloud droplets
+//      - Removed when droplets precipitate
+//      - Partitioned between convective (icscavt) and stratiform (isscavt)
+//   
+//   2. BELOW-CLOUD SCAVENGING (impaction scavenging):
+//      - Falling precipitation collects aerosols by impaction
+//      - Partitioned between convective (bcscavt) and stratiform (bsscavt)
+//   
+//   3. RESUSPENSION (pre-evaporation release):
+//      - When precipitation evaporates, scavenged aerosols are released
+//      - Two methods based on mam_prevap_resusp_optcc:
+//        Option 0: Uses evaporation fraction × scavenged flux from above
+//        Option != 0: Uses explicit resuspension mass flux (resusp_c, resusp_s)
+//
+// Scavenging Budget:
+//   Total tendency = -removal + resuspension
+//   scavt = -(in-cloud + below-cloud) + resuspension
+//
+// Unit Conversions:
+//   Mass flux [kg/m²/s] → Tendency [kg/kg/s]:
+//     tendency = flux × g / Δp
+//   
+//   Tendency [kg/kg/s] → Mass flux [kg/m²/s]:
+//     flux = tendency × Δp / g
+//
+// Parameters:
+//   mam_prevap_resusp_optcc [in] - Resuspension calculation method:
+//                                   0 = evaporation fraction method
+//                                   130/210/230 = explicit resuspension flux
+//   pdel_ik      [in]    - Pressure thickness of layer [Pa]
+//   omsm         [in]    - 1 - small_number, prevents negative roundoff [~0.9999]
+//   srcc         [in]    - Convective rain scavenging tendency [kg/kg/s]
+//   srcs         [in]    - Stratiform rain scavenging tendency [kg/kg/s]
+//   srct         [in]    - Total scavenging tendency (conv + strat) [kg/kg/s]
+//   fins         [in]    - Fraction of removal by stratiform (in-cloud) [0-1]
+//   finc         [in]    - Fraction of removal by convective (in-cloud) [0-1]
+//   fracev_st    [in]    - Fraction of stratiform precip evaporating [0-1]
+//   fracev_cu    [in]    - Fraction of convective precip evaporating [0-1]
+//   resusp_c     [in]    - Convective resuspension mass flux [kg/m²/s]
+//   resusp_s     [in]    - Stratiform resuspension mass flux [kg/m²/s]
+//   precs_ik     [in]    - Stratiform precip production rate [kg/kg/s]
+//   evaps_ik     [in]    - Stratiform precip evaporation rate [kg/kg/s]
+//   cmfdqr_ik    [in]    - Convective precip production rate [kg/kg/s]
+//   evapc_ik     [in]    - Convective precip evaporation rate [kg/kg/s]
+//   scavt_ik     [out]   - Total scavenging tendency [kg/kg/s]
+//   iscavt_ik    [out]   - Total in-cloud scavenging tendency [kg/kg/s]
+//   icscavt_ik   [out]   - In-cloud convective scavenging [kg/kg/s]
+//   isscavt_ik   [out]   - In-cloud stratiform scavenging [kg/kg/s]
+//   bcscavt_ik   [out]   - Below-cloud convective scavenging [kg/kg/s]
+//   bsscavt_ik   [out]   - Below-cloud stratiform scavenging [kg/kg/s]
+//   rcscavt_ik   [out]   - Resuspension from convective [kg/kg/s]
+//   rsscavt_ik   [out]   - Resuspension from stratiform [kg/kg/s]
+//   scavabs      [inout] - Stratiform scavenged tracer flux from above [kg/m²/s]
+//   scavabc      [inout] - Convective scavenged tracer flux from above [kg/m²/s]
+//   bsscavt_ik   [out]   - Below-cloud stratiform scavenging [kg/kg/s]
+//   rcscavt_ik   [out]   - Resuspension from convective [kg/kg/s]
+//   rsscavt_ik   [out]   - Resuspension from stratiform [kg/kg/s]
+//   scavabs      [inout] - Stratiform scavenged tracer flux from above [kg/m²/s]
+//   scavabc      [inout] - Convective scavenged tracer flux from above [kg/m²/s]
+//   precabc      [inout] - Convective precip flux from above [kg/m²/s]
+//   precabs      [inout] - Stratiform precip flux from above [kg/m²/s]
+//
+// Sign Convention:
+//   - Negative tendencies: Aerosol removal (scavenging)
+//   - Positive tendencies: Aerosol addition (resuspension)
+//
+// Output Tendency Relationships:
+//   scavt_ik = iscavt_ik + (bcscavt_ik + bsscavt_ik) + (rcscavt_ik + rsscavt_ik)
+//            = -(in-cloud) - (below-cloud) + (resuspension)
+//   
+//   iscavt_ik = icscavt_ik + isscavt_ik
+//
+// Performance Notes:
+//   - O(1) complexity
+//   - Simple arithmetic with conditionals
+//   - One division by pdel_ik (could pre-compute 1/pdel_ik if called repeatedly)
+//   - Total estimate: ~30-50 cycles
+//
+// Suggestions for Improvement:
+//   1. Use named constants for resuspension option codes
+//   2. Pre-compute gravit/pdel_ik to reduce divisions
+//   3. Consider using enum class for mam_prevap_resusp_optcc
+//   4. Fix typo in comment: "thikness" → "thickness"
+//   5. Add validation for fins, finc in [0,1] range in debug builds
+//
+// Related Functions:
+//   - calc_resusp_to_coarse(): Handles resuspension mass transfer to coarse mode
+//   - apportion_sfc_flux_deep(): Partitions surface fluxes between deep/shallow
+//=============================================================================
 KOKKOS_INLINE_FUNCTION
 void update_scavenging(const int mam_prevap_resusp_optcc, const Real pdel_ik,
                        const Real omsm, const Real srcc, const Real srcs,
@@ -230,7 +480,82 @@ void update_scavenging(const int mam_prevap_resusp_optcc, const Real pdel_ik,
     precabc = precabc + (cmfdqr_ik - evapc_ik) * pdel_ik / gravit;
   }
 }
-// ==============================================================================
+
+
+//=============================================================================
+// FUNCTION: flux_precnum_vs_flux_prec_mpln
+//=============================================================================
+// Description: Calculates the precipitation drop number flux from the 
+//              precipitation mass flux using empirical power-law relationships
+//              derived from either Marshall-Palmer or log-normal raindrop
+//              size distributions.
+//
+// Physical Background:
+//   Raindrop size distributions are commonly represented by:
+//   
+//   1. Marshall-Palmer (1948) distribution:
+//      N(D) = N₀ × exp(-λD)
+//      where N₀ = 8000 m⁻³ mm⁻¹ and λ depends on rain rate
+//      Widely used, simple exponential form
+//   
+//   2. Log-normal distribution:
+//      N(D) = (N_t / (√(2π) × σ × D)) × exp(-[ln(D/D_g)]² / (2σ²))
+//      More flexible, better fits some observed distributions
+//
+//   The relationship between number flux and mass flux follows a power law:
+//      N_flux = exp(a₀ + a₁ × ln(P_flux)) = exp(a₀) × P_flux^a₁
+//
+//   This arises because:
+//   - Mass flux P ~ ∫ D³ × v(D) × N(D) dD
+//   - Number flux N ~ ∫ v(D) × N(D) dD
+//   - The ratio depends on the size distribution shape
+//
+// Regression Form:
+//   ln(N_flux) = a₀ + a₁ × ln(P_flux)
+//   
+//   Equivalently:
+//   N_flux = exp(a₀) × P_flux^a₁
+//
+// Coefficient Interpretation:
+//   ┌────────────────────┬────────────────┬────────────────┬─────────────────┐
+//   │ Distribution       │ a₀             │ a₁             │ exp(a₀)         │
+//   ├────────────────────┼────────────────┼────────────────┼─────────────────┤
+//   │ Marshall-Palmer    │ 10.886         │ 0.437          │ ~5.3 × 10⁴      │
+//   │ Log-normal         │ 9.907          │ 0.427          │ ~2.0 × 10⁴      │
+//   └────────────────────┴────────────────┴────────────────┴─────────────────┘
+//
+//   The exponent a₁ ≈ 0.43 indicates sublinear scaling:
+//   - Doubling mass flux increases number flux by factor of ~1.35
+//   - This reflects larger drops dominating mass but smaller drops dominating number
+//
+// Parameters:
+//   flux_prec [in] - Precipitation mass flux [kg/m²/s] (note: comment says drops/m²/s)
+//   jstrcnv   [in] - Distribution type selector:
+//                    ≤ 1: Marshall-Palmer distribution
+//                    > 1: Log-normal distribution (typically jstrcnv = 2)
+//
+// Returns:
+//   Precipitation drop number flux [drops/m²/s]
+//   Returns 0.0 if flux_prec < 1.0e-36 (negligible precipitation)
+//
+// Usage Context:
+//   Used in below-cloud scavenging calculations where the collision rate
+//   between aerosols and rain drops depends on both the mass and number
+//   of precipitating drops.
+//
+// Suggestions for Improvement:
+//   1. Move magic numbers to named constants (implemented above)
+//   2. Fix input parameter comment: flux_prec units should be [kg/m²/s] not [drops/m²/s]
+//   3. Use enum class for distribution type selection
+//   4. Consider lookup table if called frequently with similar inputs
+//   5. Document source of regression coefficients (publication/derivation)
+//
+// References:
+//   - Marshall, J.S. and Palmer, W.M. (1948), "The distribution of raindrops
+//     with size", J. Meteorology, 5, 165-166
+//   - Seifert, A. (2008), "On the parameterization of evaporation of raindrops
+//     as simulated by a one-dimensional rainshaft model", J. Atmos. Sci.
+//=============================================================================
 KOKKOS_INLINE_FUNCTION
 Real flux_precnum_vs_flux_prec_mpln(const Real flux_prec, const int jstrcnv) {
   // clang-format off
