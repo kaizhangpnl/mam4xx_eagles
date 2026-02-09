@@ -32,6 +32,49 @@ constexpr int pcnst = mam4::pcnst;
 using View2D = DeviceType::view_2d<Real>;
 using View2DHost = typename HostType::view_2d<Real>;
 
+
+//=============================================================================
+// FUNCTION: modal_aero_bcscavcoef_get
+//=============================================================================
+// Description: Computes impaction scavenging removal coefficients for aerosol
+//              volume and number by interpolating pre-computed lookup tables.
+//              The tables are indexed by hygroscopic growth factor.
+//
+// Purpose: Below-cloud scavenging occurs when falling precipitation drops
+//          collide with and capture aerosol particles. This function retrieves
+//          the appropriate scavenging coefficients based on the wet aerosol size.
+//
+// Parameters:
+//   imode              [in]  - Aerosol mode index [0, num_modes)
+//   dgn_awet_imode_kk  [in]  - Wet geometric mean diameter at level kk [m]
+//   dgnum_amode_imode  [in]  - Dry geometric mean diameter for mode [m]
+//   scavimptblvol      [in]  - Lookup table for volume scavenging [View2D]
+//   scavimptblnum      [in]  - Lookup table for number scavenging [View2D]
+//   scavcoefnum_kk     [out] - Scavenging coefficient for number [1/h]
+//   scavcoefvol_kk     [out] - Scavenging coefficient for volume [1/h]
+//
+// Algorithm:
+//   1. Compute wet/dry diameter ratio as hygroscopic growth indicator
+//   2. If ratio ≈ 1.0, use table value at index 0 (no growth)
+//   3. Otherwise, perform linear interpolation between adjacent table entries
+//   4. Convert log-space table values to actual coefficients via exp()
+//
+// Table Indexing Note:
+//   - Original Fortran uses indices: [-7, 12] (nimptblgrow_mind to nimptblgrow_maxd)
+//   - C++ uses indices: [0, 19]
+//   - Conversion: jgrow_cpp = jgrow_fortran - nimptblgrow_mind
+//   - Index 0 in Fortran (no growth) maps to index 7 in C++ (-(-7) = 7)
+//
+// Performance Notes:
+//   - O(1) complexity - simple arithmetic and table lookup
+//   - Contains log() and exp() calls which are computationally expensive
+//   - Branch for wetdiaratio ≈ 1.0 avoids unnecessary computation
+//
+// Suggestions for Improvement:
+//   1. Pre-compute 1/dlndg_nimptblgrow to replace division with multiplication
+//   2. Consider using fast approximations for log/exp if precision allows
+//   3. Add bounds checking for imode in debug builds
+//=============================================================================
 KOKKOS_INLINE_FUNCTION
 void modal_aero_bcscavcoef_get(const int imode,
                                const Real dgn_awet_imode_kk, //& ! in
@@ -39,16 +82,6 @@ void modal_aero_bcscavcoef_get(const int imode,
                                const View2D &scavimptblvol,
                                const View2D &scavimptblnum,
                                Real &scavcoefnum_kk, Real &scavcoefvol_kk) {
-
-  // !-----------------------------------------------------------------------
-  // ! compute impaction scavenging removal amount for aerosol volume and number
-  // !-----------------------------------------------------------------------
-
-  // @param [in]  imode mode index
-  // @param [in]  dgn_awet_imode_kk ! wet aerosol diameter of mode imode at
-  // elevation kk [m]
-  // @param [out] scavcoefnum scavenging removal for aerosol number [1/h]
-  // @param [out] scavcoefvol scavenging removal for aerosol volume [1/h]
 
   // NOTE: original FORTRAN function has two internal loops: kk and icol.
   // We removed these loops. Hence, the inputs/outputs of
@@ -107,6 +140,48 @@ void modal_aero_bcscavcoef_get(const int imode,
 
 } // modal_aero_bcscavcoef_get
 
+
+//=============================================================================
+// FUNCTION: air_dynamic_viscosity
+//=============================================================================
+// Description: Calculates the dynamic (absolute) viscosity of air as a 
+//              function of temperature using Sutherland's Law.
+//
+// Formula: μ(T) = μ_ref * ((T_ref + S) / (T + S)) * (T / T_ref)^1.5
+//
+//          where:
+//            μ_ref = 1.8325e-4 g/cm/s (reference viscosity)
+//            T_ref = 296.16 K (reference temperature ≈ 23°C)
+//            S     = 120.0 K (Sutherland's constant for air)
+//
+// Physical Basis: Sutherland's Law is a semi-empirical formula that accounts
+//                 for the temperature dependence of gas viscosity due to
+//                 molecular interactions. Valid for ideal gas behavior.
+//
+// Parameter:
+//   temp [in] - Air temperature [K]
+//               Valid range: approximately 100 K to 1900 K for air
+//
+// Returns: Dynamic viscosity of air [g/cm/s] (CGS units)
+//          Note: To convert to SI units (Pa·s or kg/m/s), multiply by 0.1
+//
+// Reference: 
+//   - Sutherland, W. (1893), "The viscosity of gases and molecular force"
+//   - Equation form from: http://pages.erau.edu/~snivelyj/ep711sp12/EP711_15.pdf
+//
+// Note: This calculation differs from the one used in dry deposition
+//       (see modal_aero_drydep.F90 for comparison)
+//
+// Performance Notes:
+//   - O(1) complexity
+//   - Contains one pow() call (~50-100 cycles) and basic arithmetic
+//   - Could use faster approximation: pow(x, 1.5) = x * sqrt(x)
+//
+// Suggestions for Improvement:
+//   1. Replace pow(x, 1.5) with x * sqrt(x) for better performance
+//   2. Add bounds checking for temperature in debug builds
+//   3. Consider caching result if called repeatedly with same temperature
+//=============================================================================
 KOKKOS_INLINE_FUNCTION
 Real air_dynamic_viscosity(const Real temp) {
   /*-----------------------------------------------------------------
@@ -124,6 +199,56 @@ Real air_dynamic_viscosity(const Real temp) {
 
 } // end air_dynamic_viscosity
 
+
+//=============================================================================
+// FUNCTION: air_kinematic_viscosity
+//=============================================================================
+// Description: Calculates the kinematic viscosity of air from the dynamic
+//              viscosity and air density.
+//
+// Physical Definition:
+//   Kinematic viscosity (ν) = Dynamic viscosity (μ) / Density (ρ)
+//   
+//   ν represents the ratio of viscous forces to inertial forces and is
+//   commonly used in Reynolds number calculations:
+//     Re = (velocity × length) / ν
+//
+// Formula: ν = μ(T) / ρ
+//          where μ(T) is computed via Sutherland's Law in air_dynamic_viscosity()
+//
+// Parameters:
+//   temp   [in] - Air temperature [K]
+//                 Valid range: approximately 100 K to 1900 K
+//   rhoair [in] - Air mass density [g/cm³] (CGS units)
+//                 Typical sea-level value: ~1.225e-3 g/cm³
+//
+// Returns: Kinematic viscosity of air [cm²/s] (CGS units)
+//          Note: To convert to SI units (m²/s), multiply by 1.0e-4
+//          Typical sea-level value at 288 K: ~0.146 cm²/s (~1.46e-5 m²/s)
+//
+// Dependencies:
+//   - Calls air_dynamic_viscosity(temp) internally
+//
+// Performance Notes:
+//   - O(1) complexity
+//   - Dominated by air_dynamic_viscosity() call (~40-150 cycles)
+//   - Single division operation (~10-20 cycles)
+//   - Total: ~50-170 cycles
+//
+// Suggestions for Improvement:
+//   1. Add bounds checking for rhoair > 0 in debug builds to prevent division by zero
+//   2. Fix incorrect @return comment (says "dynamic viscosity" but returns kinematic)
+//   3. Consider caching dynamic viscosity if both are needed at same temperature
+//
+// Usage Example:
+//   Real temp = 288.0;           // K (standard atmosphere)
+//   Real rhoair = 1.225e-3;      // g/cm³
+//   Real nu = air_kinematic_viscosity(temp, rhoair);  // ~0.146 cm²/s
+//
+// Related Functions:
+//   - air_dynamic_viscosity(): Computes μ(T) using Sutherland's Law
+//   - calc_schmidt_number(): Uses kinematic viscosity for Schmidt number
+//=============================================================================
 KOKKOS_INLINE_FUNCTION
 Real air_kinematic_viscosity(const Real temp, const Real rhoair) {
   /*-----------------------------------------------------------------
@@ -136,25 +261,69 @@ Real air_kinematic_viscosity(const Real temp, const Real rhoair) {
 
 } // air_kinematic_viscosity
 
+
+//=============================================================================
+// FUNCTION: calc_rain_drop_conc
+//=============================================================================
+// Description: Computes rain drop number concentrations, radii, and terminal
+//              fall velocities across discrete size bins assuming a 
+//              Marshall-Palmer exponential size distribution.
+//
+// Physical Background:
+//   - Rain drop size distribution follows Marshall-Palmer (1948):
+//     N(D) = N0 * exp(-λD), where D is diameter
+//   - Terminal velocity varies with drop size due to changing Reynolds number
+//     and drag coefficient regimes (Beard, 1976)
+//   - Velocity corrected for air density: v = v_stp * sqrt(ρ_stp / ρ_air)
+//
+// Algorithm:
+//   1. Loop over size bins, computing radius and initial number concentration
+//   2. Calculate terminal velocity using size-dependent empirical formula
+//   3. Apply density correction for altitude
+//   4. Compute total precipitation rate from all bins
+//   5. Normalize number concentrations to match input precipitation rate
+//
+// Parameters:
+//   nr          [in]  - Number of rain drop size bins (typically 50)
+//   rlo         [in]  - Lower limit of rain radius [cm] (typically 0.005)
+//   dr          [in]  - Rain radius bin width [cm] (typically 0.005)
+//   rhoair      [in]  - Air mass density [g/cm³]
+//   precip      [in]  - Target precipitation rate [cm/s]
+//   rrainsv     [out] - Rain drop radius in each bin [cm]
+//   xnumrainsv  [out] - Rain drop number concentration in each bin [#/cm³]
+//   vfallrainsv [out] - Rain drop terminal fall velocity in each bin [cm/s]
+//
+// Units: All in CGS system
+//   - Length: cm
+//   - Time: s
+//   - Mass: g
+//   - Number concentration: #/cm³
+//
+// Performance Notes:
+//   - O(nr) complexity, typically nr = 50 bins
+//   - Contains multiple haero::pow() calls per iteration (~50-100 cycles each)
+//   - Two loops: main calculation + normalization
+//   - Total estimate: ~3000-5000 cycles for nr=50
+//
+// Suggestions for Improvement:
+//   1. Move constants to namespace scope (implemented above)
+//   2. Pre-compute 1/marshall_palmer_scale to replace division with multiplication
+//   3. For regime 3 (exponent ≈ 1.008), consider linear approximation
+//   4. Consider loop fusion or vectorization hints
+//   5. Add bounds checking for nr <= nrainsvmax in debug builds
+//
+// References:
+//   - Marshall, J.S. and Palmer, W.M. (1948), "The distribution of raindrops 
+//     with size", J. Meteorology, 5, 165-166
+//   - Beard, K.V. (1976), "Terminal velocity and shape of cloud and 
+//     precipitation drops aloft", J. Atmos. Sci., 33, 851-864
+//=============================================================================
 KOKKOS_INLINE_FUNCTION
 void calc_rain_drop_conc(const int nr, const Real rlo, const Real dr,
                          const Real rhoair,
                          const Real precip, //! in
                          Real rrainsv[nrainsvmax], Real xnumrainsv[nrainsvmax],
                          Real vfallrainsv[nrainsvmax]) {
-  /*-----------------------------------------------------------------
-  !   compute rain drop number concentrations, radius and falling velocity
-  !-----------------------------------------------------------------*/
-  // @param [in] nr           number of rain bins
-  // @param [in] rlo          lower limit of rain radius [cm]
-  // @param [in] dr           rain radius bin width [cm]
-  // @param [in] rhoair       air mass density [g/cm^3]
-  // @param [in] precip       precipitation [cm/s]
-
-  // @param [out] rrainsv(:)   rain radius in each bin [cm]
-  // @param [out] xnumrainsv(:)  rain number concentration in each
-  // @param [out] vfallrainsv(:) rain droplet falling bin [#/cm3]
-  // @param [out] velocity [cm/s] bin [#/cm3]
 
   const Real zero = 0;
   Real precipsum = zero;
@@ -194,6 +363,34 @@ void calc_rain_drop_conc(const int nr, const Real rlo, const Real dr,
 
 } // calc_rain_drop_conc
 
+
+//=============================================================================
+// FUNCTION: calc_aer_conc_frac
+//=============================================================================
+// Description: Computes aerosol concentration, radius, and volume fraction
+//              in each size bin assuming a log-normal distribution.
+//
+// Parameters:
+//   na          [in]  - Number of aerosol bins
+//   xlo         [in]  - Lower limit of aerosol radius (log scale)
+//   dx          [in]  - Aerosol radius bin width (log scale)
+//   xg0         [in]  - Log of geometric mean radius: log(r_mean)
+//   sx          [in]  - Standard deviation in log space (log-sigma)
+//   raerosv     [out] - Aerosol radius for each bin [cm]
+//   fnumaerosv  [out] - Fraction of total number in each bin [fraction]
+//   fvolaerosv  [out] - Fraction of total volume in each bin [fraction]
+//
+// Algorithm: Uses log-normal distribution: 
+//   n(r) ~ exp(-0.5*((ln(r)-ln(r_g))/ln(sigma))^2)
+//
+// Performance Note: O(n) where n = number of bins (typically small ~10-20)
+//   - Contains expensive exp() calls in loop
+//   - Loop is vectorizable
+// Suggestion:
+//   1. Consider vectorization hints (#pragma omp simd or Kokkos::parallel_for)
+//   2. Pre-compute 1/sx outside loop to replace division with multiplication
+//   3. Could use exp2() if available for better performance on some architectures
+//=============================================================================
 KOKKOS_INLINE_FUNCTION
 void calc_aer_conc_frac(const int na, const Real xlo, const Real dx,
                         const Real xg0,
@@ -201,21 +398,6 @@ void calc_aer_conc_frac(const int na, const Real xlo, const Real dx,
                         Real raerosv[naerosvmax], Real fnumaerosv[naerosvmax],
                         Real fvolaerosv[naerosvmax]) // out
 {
-
-  /*-----------------------------------------------------------------
-  !   compute aerosol concentration, radius and volume in each bin
-  !-----------------------------------------------------------------*/
-
-  // @param [in]  na           ! number of aerosol bins
-  // @param [in]  xlo          ! lower limit of aerosol radius (log)
-  // @param [in]  dx           ! aerosol radius bin width (log)
-  // @param [in]  xg0          ! log(mean radius)
-  // @param [in]  sx           ! standard deviation (log)
-
-  // @param [out] raerosv(:)   ! aerosol radius [cm]
-  // @param [out] fnumaerosv(:)! fraction of total number in the bin
-  // @param [out] fvolaerosv(:)! fraction of total volume
-  // in the bin [fraction]
 
   // ! calculate total aerosol number and volume
   const Real zero = 0;
@@ -245,6 +427,73 @@ void calc_aer_conc_frac(const int na, const Real xlo, const Real dx,
 
 } // calc_aer_conc_frac
 
+
+//=============================================================================
+// FUNCTION: calc_schmidt_number
+//=============================================================================
+// Description: Calculates the Schmidt number and particle relaxation time
+//              for aerosol particles. These dimensionless numbers are used
+//              in impaction scavenging calculations.
+//
+// Physical Background:
+//   Schmidt Number (Sc):
+//     Sc = ν / D = (kinematic viscosity) / (particle diffusivity)
+//     - Represents ratio of momentum diffusivity to mass diffusivity
+//     - High Sc means particle diffusion is slow relative to momentum transfer
+//     - Typical values for aerosols: 10 to 10^6 (size dependent)
+//
+//   Relaxation Time (τ):
+//     τ = (2 * ρ_p * r² * C) / (9 * μ)
+//     - Time for particle velocity to adjust to fluid velocity
+//     - Used to calculate Stokes number: St = τ * U / L
+//     - Includes Cunningham slip correction for small particles
+//
+//   Cunningham Slip Correction (C):
+//     C = 1 + Kn * (A1 + A2 * exp(-A3/Kn))
+//     - Corrects Stokes drag for rarefied gas effects when particle
+//       size approaches molecular mean free path
+//     - Kn = λ/r is the Knudsen number
+//     - For Kn << 1 (large particles): C ≈ 1
+//     - For Kn >> 1 (small particles): C >> 1
+//
+// Parameters:
+//   freepath   [in]  - Molecular mean free path [cm]
+//                      Typical sea-level value: ~6.5e-6 cm
+//   r_aer      [in]  - Aerosol particle radius [cm]
+//   temp       [in]  - Air temperature [K]
+//   rhoaero    [in]  - Aerosol particle density [g/cm³]
+//   rhoair     [in]  - Air mass density [g/cm³]
+//   airkinvisc [in]  - Air kinematic viscosity [cm²/s]
+//   schmidt    [out] - Schmidt number [dimensionless]
+//   taurelax   [out] - Particle relaxation time [s]
+//
+// Units: All in CGS system
+//   - Length: cm
+//   - Time: s
+//   - Mass: g
+//   - Energy: erg (for Boltzmann constant conversion)
+//
+// Note: A similar Schmidt number calculation exists in dry deposition
+//       (modal_aero_drydep.F90) but uses different slip correction formula.
+//
+// Performance Notes:
+//   - O(1) complexity
+//   - Contains one haero::exp() call (~50-100 cycles)
+//   - Multiple divisions and multiplications
+//   - Total estimate: ~100-200 cycles
+//
+// Suggestions for Improvement:
+//   1. Move constants to namespace scope (implemented above)
+//   2. Pre-compute boltz_cgs at compile time
+//   3. Add bounds checking for r_aer > 0 in debug builds
+//   4. Consider combining divisions to reduce operations
+//
+// References:
+//   - Davies, C.N. (1945), "Definitive equations for the fluid resistance 
+//     of spheres", Proc. Phys. Soc., 57, 259-270
+//   - Fuchs, N.A. (1964), "The Mechanics of Aerosols", Pergamon Press
+//   - Seinfeld & Pandis (2006), "Atmospheric Chemistry and Physics", Ch. 9
+//=============================================================================
 KOKKOS_INLINE_FUNCTION
 void calc_schmidt_number(const Real freepath, const Real r_aer,
                          const Real temp, //& ! in
@@ -252,25 +501,6 @@ void calc_schmidt_number(const Real freepath, const Real r_aer,
                          const Real airkinvisc,         // & ! in
                          Real &schmidt, Real &taurelax) //! out
 {
-  /*-----------------------------------------------------------------
-  ! calculate Schmidt number
-  ! also output relaxation time for Stokes number
-  !
-  ! note that there is a similar calculation of Schmidt number in dry
-  ! depositon (in modal_aero_drydep.F90) but the calculation of dumfuchs (or
-  ! slip_correction_factor) looks differently
-  !-----------------------------------------------------------------*/
-
-  // @param [in]  freepath      ! molecular freepath [cm]
-  // @param [in]  r_aer         ! aerosol radius [cm]
-  // @param [in]  temp          ! temperature [K]
-  // @param [in]  rhoaero       ! density of aerosol particles[g/cm^3]
-  // @param [in]  rhoair        ! air mass density [g/cm^3]
-  // @param [in]  airkinvisc    ! air kinematic viscosity [cm2/s]
-
-  // @param [out]  schmidt       ! Schmidt number [unitless]
-  // @param [out]  taurelax      ! relaxation time for Stokes number
-  // [s]
 
   // Unit conversion from J/K/molecule to erg/K
   const Real one = 1.;
@@ -295,6 +525,79 @@ void calc_schmidt_number(const Real freepath, const Real r_aer,
   schmidt = airkinvisc / aerodiffus;
 }
 
+
+//=============================================================================
+// FUNCTION: calc_impact_efficiency
+//=============================================================================
+// Description: Calculates the total aerosol-raindrop collection efficiency
+//              by combining three physical mechanisms:
+//              1. Brownian diffusion (dominant for small particles)
+//              2. Interception (geometric contact)
+//              3. Inertial impaction (dominant for large particles)
+//
+// Physical Background:
+//   Below-cloud scavenging occurs when falling raindrops collect aerosol
+//   particles through various mechanisms. The collection efficiency E
+//   represents the fraction of particles in the geometric sweep volume
+//   that are actually collected.
+//
+//   Total efficiency: E_total = E_Brown + E_intercept + E_impact
+//
+//   The "Greenfield gap" (~0.1-1 μm) is where collection is minimum because
+//   particles are too large for efficient Brownian capture but too small
+//   for effective impaction.
+//
+// Brownian Diffusion (E_Brown):
+//   - Dominant for ultrafine particles (< 0.1 μm)
+//   - Particles diffuse across streamlines and contact drop surface
+//   - E_Brown ~ Sc^(-2/3) for high Schmidt numbers
+//   - Formula: E = 4*(1 + 0.4*Re^0.5*Sc^(1/3)) / (Re*Sc)
+//
+// Interception (E_intercept):
+//   - Particles following streamlines contact drop when passing within
+//     one particle radius of the drop surface
+//   - Depends on size ratio χ = r_aer / r_rain
+//   - Includes viscosity ratio correction for internal circulation
+//   - Formula: E = 4*χ*(χ + f(μ_ratio, Re, χ))
+//
+// Inertial Impaction (E_impact):
+//   - Dominant for large particles (> 1 μm)
+//   - Particles deviate from streamlines due to inertia
+//   - Only occurs when Stokes number exceeds critical value S*
+//   - Formula: E = ((St - S*) / (St - S* + 2/3))^1.5, for St > S*
+//
+// Parameters:
+//   r_aer      [in]  - Aerosol particle radius [cm]
+//   r_rain     [in]  - Rain drop radius [cm]
+//   temp       [in]  - Air temperature [K]
+//   freepath   [in]  - Molecular mean free path [cm]
+//   rhoaero    [in]  - Aerosol particle density [g/cm³]
+//   rhoair     [in]  - Air mass density [g/cm³]
+//   vfall      [in]  - Rain drop terminal fall velocity [cm/s]
+//   airkinvisc [in]  - Air kinematic viscosity [cm²/s]
+//   etotal     [out] - Total collection efficiency [fraction, 0-1]
+//
+// Units: All in CGS system
+//
+// Performance Notes:
+//   - O(1) complexity
+//   - Calls calc_schmidt_number() internally (~100-200 cycles)
+//   - Contains multiple haero::pow(), haero::sqrt(), haero::log() calls
+//   - Total estimate: ~300-500 cycles
+//
+// Suggestions for Improvement:
+//   1. Move constants to namespace scope (implemented above)
+//   2. Replace pow(x, 1/3) with cbrt(x) if available
+//   3. Replace pow(x, 1.5) with x * sqrt(x)
+//   4. Pre-compute frequently used values (sqrtreynolds already done)
+//   5. Add bounds checking for input radii > 0 in debug builds
+//
+// References:
+//   - Slinn, W.G.N. (1983), "Precipitation Scavenging", in Atmospheric 
+//     Sciences and Power Production, Ch. 11
+//   - Seinfeld & Pandis (2006), "Atmospheric Chemistry and Physics", Ch. 20
+//   - Pruppacher & Klett (1997), "Microphysics of Clouds and Precipitation"
+//=============================================================================
 KOKKOS_INLINE_FUNCTION
 void calc_impact_efficiency(const Real r_aer, const Real r_rain,
                             const Real temp, //   & ! in
@@ -302,21 +605,6 @@ void calc_impact_efficiency(const Real r_aer, const Real r_rain,
                             const Real rhoair,                       // & ! in
                             const Real vfall, const Real airkinvisc, // & ! in
                             Real &etotal) {
-
-  /*-----------------------------------------------------------------
-  ! calculate aerosol-collection efficiency for a given radius of rain and
-  aerosol particles
-  !-----------------------------------------------------------------*/
-  // @param [in]  r_aer         ! aerosol radius [cm]
-  // @param [in]  r_rain        ! rain radius [cm]
-  // @param [in]  temp          ! temperature [K]
-  // @param [in]  freepath      ! molecular freepath [cm]
-  // @param [in]  rhoaero       ! density of aerosol particles
-  // @param [in]  rhoair        ! air mass density [g/cm^3]
-  // @param [in]  airkinvisc    ! air kinematic viscosity [cm^2/s]
-  // @param [in]  vfall         ! rain droplet falling speed [cm/s]
-  // @param [out] etotal        ! efficiency of total effects
-  // [fraction]
 
   // ! local variables
   const Real zero = 0.;
@@ -370,7 +658,74 @@ void calc_impact_efficiency(const Real r_aer, const Real r_rain,
   etotal = haero::min(etotal, one);
 } // calc_impact_efficiency
 
-/*=====================================================================*/
+
+//=============================================================================
+// FUNCTION: calc_1_impact_rate
+//=============================================================================
+// Description: Computes below-cloud impaction scavenging rates for aerosol
+//              number and volume concentrations at a reference precipitation
+//              rate of 1 mm/hr. Results can be scaled linearly for other
+//              precipitation rates.
+//
+// Physical Background:
+//   Below-cloud scavenging (washout) occurs when falling precipitation drops
+//   collect aerosol particles through three mechanisms:
+//   1. Brownian diffusion (small particles)
+//   2. Interception (intermediate particles)
+//   3. Inertial impaction (large particles)
+//
+//   The scavenging rate Λ is computed as:
+//     Λ = ∫∫ π*R² * V(R) * E(r,R) * n(R) * f(r) dR dr
+//   where:
+//     R = rain drop radius
+//     r = aerosol particle radius
+//     V(R) = rain drop terminal velocity
+//     E(r,R) = collection efficiency
+//     n(R) = rain drop number distribution
+//     f(r) = aerosol size distribution fraction
+//
+// Algorithm:
+//   1. Set up rain drop size bins (Marshall-Palmer distribution)
+//   2. Set up aerosol size bins (log-normal distribution)
+//   3. Compute atmospheric properties (air density, viscosity, mean free path)
+//   4. Double integration over rain and aerosol size distributions
+//   5. Convert scavenging rate from 1/s to 1/hr
+//
+// Parameters:
+//   dg0         [in]  - Geometric mean diameter of aerosol [cm]
+//   sigmag      [in]  - Geometric standard deviation of size distribution [dimensionless]
+//   rhoaero     [in]  - Aerosol particle density [g/cm³]
+//   temp        [in]  - Air temperature [K]
+//   press       [in]  - Air pressure [dyne/cm²] (CGS units)
+//   scavratenum [out] - Scavenging rate for aerosol number [1/hr]
+//   scavratevol [out] - Scavenging rate for aerosol volume [1/hr]
+//
+// Units: All internal calculations in CGS system
+//   - Length: cm
+//   - Time: s (converted to hr for output)
+//   - Mass: g
+//   - Pressure: dyne/cm² (converted internally to Pa for density calculation)
+//
+// Performance Notes:
+//   - O(nr × na) complexity due to nested loops
+//   - Typical: nr=50 rain bins × na≈10-20 aerosol bins = 500-1000 iterations
+//   - Each iteration calls calc_impact_efficiency() (~300-500 cycles)
+//   - Total estimate: ~200,000-500,000 cycles
+//   - Contains multiple log(), exp(), sqrt(), pow() calls
+//
+// Suggestions for Improvement:
+//   1. Move constants to namespace scope (implemented above)
+//   2. Pre-compute rain sweep-out volume outside inner loop (done partially)
+//   3. Consider vectorization of inner loop with SIMD hints
+//   4. Cache frequently accessed array values in registers
+//   5. Consider lookup table for collection efficiency if called repeatedly
+//   6. Use Kokkos::parallel_reduce for the nested loops on GPU
+//
+// References:
+//   - Slinn, W.G.N. (1983), "Precipitation Scavenging", Ch. 11
+//   - Seinfeld & Pandis (2006), "Atmospheric Chemistry and Physics", Ch. 20
+//   - Marshall & Palmer (1948), "The distribution of raindrops with size"
+//=============================================================================
 KOKKOS_INLINE_FUNCTION
 void calc_1_impact_rate(const Real dg0,     //  in
                         const Real sigmag,  //  in
@@ -381,32 +736,6 @@ void calc_1_impact_rate(const Real dg0,     //  in
                         Real &scavratevol)  // out
 
 {
-  // this subroutine computes a single impaction scavenging rate
-  //  for precipitation rate of 1 mm/h
-
-  //   function parameters
-  // @param [in]  dg0         geometric mean diameter of aerosol
-  // @param [in]  sigmag      geometric standard deviation of
-  // size distribution [cm]
-  // @param [in]  rhoaero     aerosol density [g/cm^3]
-  // @param [in]  temp        temperature [K] real(r8),
-  // @param [in]  press       pressure [dyne/cm^2]
-  // @param [out] scavratenum scavenging rate for aerosol number [1/hour]
-  // @param [out] scavratenum scavenging rate for aerosol volume [1/hour]
-
-  // const Real SHR_CONST_BOLTZ =
-  //     1.38065e-23; //  ! Boltzmann's constant ~ J/K/molecule
-  // const Real SHR_CONST_AVOGAD =
-  //     6.02214e26; //   ! Avogadro's number ~ molecules/kmole
-  // const Real rgas_kmol =
-  //     SHR_CONST_AVOGAD *
-  //     SHR_CONST_BOLTZ; //       ! Universal gas constant ~ J/K/kmole => ! Gas
-  //                      //       constant (J/K/mol)
-  // const Real rgas = rgas_kmol * 1.e-3 * 1.e7; //
-  // air molar density [dyne/cm^2/erg*mol = mol/cm^3]
-  // const Real cair = press / (rgas * temp);
-  // air molar density [mol/cm^3]
-  // const Real rhoair = 28.966 * cair;
 
   const Real pi = haero::Constants::pi;
   const Real zero = 0;
@@ -542,27 +871,85 @@ void calc_1_impact_rate(const Real dg0,     //  in
 
 } // end calc_1_impact_rate
 
+
+//=============================================================================
+// FUNCTION: modal_aero_bcscavcoef_init
+//=============================================================================
+// Description: Computes and initializes lookup tables for below-cloud aerosol 
+//              impaction/interception scavenging rates. Tables are indexed by
+//              aerosol mode and hygroscopic growth factor.
+//
+// Purpose:
+//   Pre-compute scavenging rates for various wet/dry diameter ratios to avoid
+//   expensive runtime calculations. During model integration, actual rates
+//   are obtained by interpolating these tables based on current wet diameter.
+//
+// Physical Background:
+//   Below-cloud scavenging (washout) depends on aerosol wet size, which varies
+//   with relative humidity through hygroscopic growth. Rather than computing
+//   scavenging rates at every timestep, we pre-compute rates across a range
+//   of growth factors and store as log(rate) for linear interpolation.
+//
+//   Growth factor range: exp(-7 * ln(1.25)) to exp(12 * ln(1.25))
+//                      = 0.178 to 14.55 (wet/dry diameter ratio)
+//
+// Algorithm:
+//   1. Loop over aerosol modes (4 modes in MAM4)
+//   2. Loop over growth factor indices (-7 to +12, total 20 entries)
+//   3. For each combination:
+//      a. Compute wet diameter from dry diameter and growth factor
+//      b. Compute wet density (currently using dry density due to bug)
+//      c. Convert units from SI to CGS
+//      d. Call calc_1_impact_rate() for 1 mm/hr precipitation
+//      e. Store log(rate) in lookup table for later interpolation
+//
+// Parameters:
+//   dgnum_amode         [in]  - Geometric mean diameters for each mode [m]
+//   sigmag_amode        [in]  - Geometric standard deviations [dimensionless]
+//   aerosol_dry_density [in]  - Dry aerosol density for each mode [kg/m³]
+//   scavimptblnum       [out] - Lookup table for number scavenging rate [log(1/hr)]
+//   scavimptblvol       [out] - Lookup table for volume scavenging rate [log(1/hr)]
+//
+// Table Dimensions:
+//   - First index: jgrow - nimptblgrow_mind = 0 to 19 (20 growth levels)
+//   - Second index: imode = 0 to 3 (4 aerosol modes)
+//   - Values stored as natural log for linear interpolation in log-space
+//
+// Units:
+//   - Input: SI units (m, kg/m³)
+//   - Internal calculation: CGS units (cm, g/cm³, dyne/cm²)
+//   - Output: log(1/hr) stored in tables
+//
+// Performance Notes:
+//   - O(num_modes × num_growth_levels) = O(4 × 20) = O(80) iterations
+//   - Each iteration calls calc_1_impact_rate (~200,000-500,000 cycles)
+//   - Total initialization: ~20-40 million cycles (one-time cost)
+//   - Called once during model initialization, not during timestepping
+//
+// Suggestions for Improvement:
+//   1. Fix the wet density calculation bug (see FIXME note)
+//   2. Move magic numbers to named constants (implemented above)
+//   3. Consider parallelizing outer loop over modes
+//   4. Add validation checks for input arrays
+//   5. Document why 750 hPa and 0°C were chosen as reference conditions
+//
+// Known Bug (FIXME):
+//   The wet aerosol density calculation is incorrect:
+//     rhowetaero = 1.0 + (rhodryaero - 1.0) / wetvolratio
+//   This formula assumes water density = 1.0 kg/m³, but it should be 1000 kg/m³
+//   The correct formula should be:
+//     rhowetaero = rho_water + (rhodryaero - rho_water) / wetvolratio
+//   Currently bypassed by setting rhowetaero = rhodryaero for BFB testing.
+//
+// References:
+//   - Slinn, W.G.N. (1983), "Precipitation Scavenging", Ch. 11
+//=============================================================================
 inline void modal_aero_bcscavcoef_init(
     const Real dgnum_amode[AeroConfig::num_modes()],
     const Real sigmag_amode[AeroConfig::num_modes()],
     const Real aerosol_dry_density[AeroConfig::num_modes()],
     // outputs
     View2DHost scavimptblnum, View2DHost scavimptblvol) {
-  // -----------------------------------------------------------------------
-  //
-  //  Purpose:
-  //  Computes lookup table for aerosol impaction/interception scavenging rates
-  //
-  //  Authors: R. Easter
-  //
-  // -----------------------------------------------------------------------
-  // @param [in]   dgnum_amode aerosol diameters [m]
-  // @param [in]   sigmag_amode standard deviation of aerosol size distribution
-  // @param [out]  scavimptblnum scavenging rate of aerosol number [1/s]
-  // @param [out]  scavimptblnum scavenging rate of aerosol volume [1/s]
-  // @aerosol_dry_density [in] aerosol dry density [k/m3]
-  // FIXME : create an 4 elements array that contains the aerosol densities to
-  // replace specdens_amode and lspectype_amode
 
   const Real zero = 0;
   const Real one = 1;
@@ -625,7 +1012,78 @@ inline void modal_aero_bcscavcoef_init(
 
 } // modal_aero_bcscavcoef_init
 
-// =============================================================================
+
+//=============================================================================
+// Physical Background:
+//   Wet removal of aerosols occurs through multiple mechanisms:
+//   
+//   1. Stratiform In-Cloud (sol_facti):
+//      - Removal of aerosols within stratiform cloud layers
+//      - For interstitial: OFF (aerosols must first activate into droplets)
+//      - For cloud-borne: ON (already in droplets, removed with precip)
+//   
+//   2. Convective In-Cloud (sol_factic):
+//      - Removal of aerosols within convective updrafts
+//      - For interstitial: Tuning factor (aerosols entrained into updrafts)
+//      - For cloud-borne: OFF (convective precip doesn't collect strat droplets)
+//   
+//   3. Below-Cloud (sol_factb):
+//      - Impaction scavenging by falling precipitation
+//      - For interstitial: ON (aerosols below cloud base can be collected)
+//      - For cloud-borne: OFF (cloud-borne aerosols are "in-cloud" by definition)
+//   
+//   4. Convective Activation (f_act_conv):
+//      - Fraction of aerosols activated in convective clouds
+//      - Primary carbon mode: 0 (hydrophobic, doesn't activate)
+//      - Other modes: Based on input activation fraction
+//
+// Historical Notes (from original code):
+//   - 2008-mar-07 (rce): sol_factb changed from 0.3 to 0.1
+//   - 2008-mar-07 (rce): sol_factic for dust modes changed from 1.0 to 0.5
+//   - 2010-may-02 (rce): Separated activation fraction from tuning factor
+//                        for convective in-cloud removal
+//
+// Parameters:
+//   lphase                              [in]  - Phase index:
+//                                               1 = interstitial aerosol
+//                                               2 = cloud-borne aerosol
+//   imode                               [in]  - Aerosol mode index (0-3 for MAM4)
+//   scav_fraction_in_cloud_strat        [in]  - Stratiform in-cloud scav fraction [0-1]
+//   scav_fraction_in_cloud_conv         [in]  - Convective in-cloud scav fraction [0-1]
+//   scav_fraction_below_cloud_strat     [in]  - Below-cloud scav fraction [0-1]
+//   activation_fraction_in_cloud_conv   [in]  - Convective activation fraction [0-1]
+//   sol_facti                           [out] - Stratiform in-cloud scav fraction [0-1]
+//   sol_factic                          [out] - Convective in-cloud scav fraction [0-1]
+//   sol_factb                           [out] - Below-cloud scav fraction [0-1]
+//   f_act_conv                          [out] - Convective activation fraction [0-1]
+//
+// Output Logic Summary:
+//   ┌─────────────────┬─────────────────────────┬────────────────────────┐
+//   │ Parameter       │ Interstitial (lphase=1) │ Cloud-borne (lphase=2) │
+//   ├─────────────────┼─────────────────────────┼────────────────────────┤
+//   │ sol_facti       │ 0.0                     │ min(0.6, input)        │
+//   │ sol_factic      │ input                   │ 0.0                    │
+//   │ sol_factb       │ input                   │ 0.0                    │
+//   │ f_act_conv      │ 0 if pcarbon, else input│ 0.0                    │
+//   └─────────────────┴─────────────────────────┴────────────────────────┘
+//
+// Performance Notes:
+//   - O(1) complexity - simple conditional assignments
+//   - No expensive operations (single min() call)
+//   - Total estimate: ~10-20 cycles
+//
+// Suggestions for Improvement:
+//   1. Move magic number 0.6 to named constant (implemented above)
+//   2. Use enum class for lphase to improve type safety
+//   3. Consider struct return type to bundle output parameters
+//   4. Add validation for lphase values in debug builds
+//
+// Future Considerations (from original comments):
+//   - Non-activation of aerosol in entrained air should be included
+//   - Could use activate routine with w ~= 1 m/s to calculate activation
+//   - Entrainment issues need to be addressed
+//
+//=============================================================================
 KOKKOS_INLINE_FUNCTION
 void define_act_frac(const int lphase, const int imode,
                      const Real scav_fraction_in_cloud_strat,
@@ -636,7 +1094,7 @@ void define_act_frac(const int lphase, const int imode,
                      Real &f_act_conv) {
   // clang-format off
   // -----------------------------------------------------------------------
-  //  define sol_factb and sol_facti values, and f_act_conv
+  // define sol_factb and sol_facti values, and f_act_conv
   // sol_factb - currently this is basically a tuning factor
   // sol_facti & sol_factic - currently has a physical basis, and
   // reflects activation fraction
@@ -661,16 +1119,6 @@ void define_act_frac(const int lphase, const int imode,
   //
   // sol_factic is strictly a tuning factor
   //-----------------------------------------------------------------------
-  /*
-
-  in :: lphase ! index for interstitial / cloudborne aerosol
-  in :: imode  ! index for aerosol mode
-
-  out :: sol_facti  ! in-cloud scavenging fraction
-  out :: sol_factb  ! below-cloud scavenging fraction
-  out :: sol_factic ! in-cloud convective scavenging fraction
-  out :: f_act_conv ! convection activation fraction
-  */
   // clang-format on
   const int modeptr_pcarbon = static_cast<int>(mam4::ModeIndex::PrimaryCarbon);
   if (lphase == 1) { // interstial aerosol
@@ -703,6 +1151,57 @@ void define_act_frac(const int lphase, const int imode,
   }
 }
 
+
+//=============================================================================
+// FUNCTION: lptr_dust_a_amode
+//=============================================================================
+// Description: Returns the tracer array index (pointer) for dust aerosol
+//              species in the specified aerosol mode.
+//
+// Physical Background:
+//   Mineral dust in MAM4 is present only in certain modes:
+//   - Accumulation mode (mode 0): Fine dust from aging/coagulation
+//   - Coarse mode (mode 2): Primary dust emissions (dominant source)
+//   
+//   Dust is NOT present in:
+//   - Aitken mode (mode 1): Particles too small for dust
+//   - Primary Carbon mode (mode 3): Contains only carbonaceous aerosols
+//
+// Parameter:
+//   imode [in] - Aerosol mode index (0 to num_modes-1)
+//                0 = Accumulation
+//                1 = Aitken
+//                2 = Coarse
+//                3 = Primary Carbon
+//
+// Returns: 
+//   - Positive integer: Valid tracer array index for dust in that mode
+//   - -999888777: Dust is not simulated in that mode (invalid marker)
+//
+// Usage Example:
+//   int idx = lptr_dust_a_amode(2);  // Returns 28 (coarse mode dust index)
+//   int idx = lptr_dust_a_amode(1);  // Returns -999888777 (no dust in Aitken)
+//
+//   // Check if dust exists in mode before accessing:
+//   if (lptr_dust_a_amode(imode) > 0) {
+//       // Safe to access dust tracer for this mode
+//   }
+//
+// Performance Notes:
+//   - O(1) lookup
+//   - Original: Array initialized on each call (inefficient)
+//   - Improved: Static constexpr array at namespace scope (zero runtime cost)
+//
+// Suggestions for Improvement:
+//   1. Move array to namespace scope as constexpr (implemented above)
+//   2. Add bounds checking for imode in debug builds
+//   3. Consider returning std::optional<int> or using sentinel value consistently
+//   4. Document the magic number -999888777 with a named constant
+//
+// Related Functions:
+//   - lptr_nacl_a_amode(): Returns index for sea salt (NaCl) species
+//   - lmassptr_amode(): Returns index for general species mass mixing ratio
+//=============================================================================
 KOKKOS_INLINE_FUNCTION
 int lptr_dust_a_amode(const int imode) {
   const int num_modes = AeroConfig::num_modes();
@@ -710,12 +1209,38 @@ int lptr_dust_a_amode(const int imode) {
   return lptr_dust_a_amode[imode];
 }
 
+//=============================================================================
+// FUNCTION: lptr_nacl_a_amode
+//=============================================================================
+// Description: Returns the pointer/index for sodium chloride (NaCl) aerosol
+//              in the specified aerosol mode.
+// 
+// Parameter:
+//   imode - Index of the aerosol mode (0 to num_modes-1)
+//
+// Returns: Index into the aerosol array for NaCl species in the given mode
+//=============================================================================
+
 KOKKOS_INLINE_FUNCTION
 int lptr_nacl_a_amode(const int imode) {
   const int num_modes = AeroConfig::num_modes();
   const int lptr_nacl_a_amode[num_modes] = {20, 25, 29, -999888777};
   return lptr_nacl_a_amode[imode];
 }
+
+//=============================================================================
+// FUNCTION: mmtoo_prevap_resusp
+//=============================================================================
+// Description: Returns the mapping index for pre-evaporation resuspension
+//              tracer conversion. Maps constituent index to target tracer.
+//              -1 indicates no mapping (species not simulated)
+//              -3 indicates special handling required
+//
+// Parameter:
+//   i - Constituent index (0 to pcnst-1)
+//
+// Returns: Target tracer index or negative value for special cases
+//
 
 KOKKOS_INLINE_FUNCTION
 int mmtoo_prevap_resusp(const int i) {
@@ -726,10 +1251,21 @@ int mmtoo_prevap_resusp(const int i) {
   return mmtoo_prevap_resusp[i];
 }
 
-// lmassptr_amode(l,m) = gchm r-array index for the mixing ratio
-// (moles-x/mole-air) for chemical species l in aerosol mode m
-// that is in clear air or interstitial air (but not in cloud water).
-// If negative then number is not being simulated.
+//=============================================================================
+// FUNCTION: lmassptr_amode
+//=============================================================================
+// Description: Returns the global chemistry (gchm) r-array index for the 
+//              mixing ratio (moles-x/mole-air) for chemical species l in 
+//              aerosol mode m. This refers to aerosols in clear air or 
+//              interstitial air (NOT in cloud water).
+//
+// Parameters:
+//   i     - Chemical species index (0 to maxd_aspectype-1)
+//   imode - Aerosol mode index (0 to num_modes-1)
+//
+// Returns: Array index for the species mixing ratio, or -1 if the species
+//          is not being simulated in that mode
+//=============================================================================
 KOKKOS_INLINE_FUNCTION
 int lmassptr_amode(const int i, const int imode) {
   const int num_modes = AeroConfig::num_modes();
@@ -740,23 +1276,77 @@ int lmassptr_amode(const int i, const int imode) {
       {-1, -1, -1, -1}, {-1, -1, -1, -1}};
   return lmassptr_amode[i][imode];
 }
-// lmassptrcw_amode(l,m) = gchm r-array index for the mixing ratio
-// (moles-x/mole-air) for chemical species l in aerosol mode m
-// that is currently bound/dissolved in cloud water
+
+//=============================================================================
+// FUNCTION: lmassptrcw_amode
+//=============================================================================
+// Description: Returns the gchm r-array index for the mixing ratio of 
+//              chemical species l in aerosol mode m that is currently 
+//              bound/dissolved in cloud water.
+//
+// Note: Currently delegates to lmassptr_amode - same indices used for
+//       both interstitial and cloud-borne aerosols
+//
+// Add comment explaining why cloud-water uses same indexing
+// as interstitial, or if this is a placeholder for future work
+//=============================================================================
 KOKKOS_INLINE_FUNCTION
 int lmassptrcw_amode(const int i, const int j) { return lmassptr_amode(i, j); }
-// numptr_amode(m) = gchm r-array index for the number mixing ratio
-// (particles/mole-air) for aerosol mode m that is in clear air or
-// interstitial are (but not in cloud water).  If zero or negative,
-// then number is not being simulated.
+
+
+//=============================================================================
+// FUNCTION: numptr_amode
+//=============================================================================
+// Description: Returns the gchm r-array index for the number mixing ratio
+//              (particles/mole-air) for aerosol mode m in clear/interstitial
+//              air (not in cloud water).
+//
+// Parameter:
+//   i - Aerosol mode index (0 to num_modes-1)
+//
+// Returns: Array index for number mixing ratio. Zero or negative indicates
+//          number is not being simulated.
+//
+// Performance Note: Small array (4 elements), efficient lookup
+// Suggestion: Add bounds checking for i parameter
+//=============================================================================
 KOKKOS_INLINE_FUNCTION
 int numptr_amode(const int i) {
   const int num_modes = AeroConfig::num_modes();
   const int numptr_amode[num_modes] = {22, 27, 35, 39};
   return numptr_amode[i];
 }
+
+
+//=============================================================================
+// FUNCTION: numptrcw_amode
+//=============================================================================
+// Description: Returns number mixing ratio index for cloud-borne aerosols.
+//              Currently uses same indexing as interstitial aerosols.
+//=============================================================================
 KOKKOS_INLINE_FUNCTION
 int numptrcw_amode(const int i) { return numptr_amode(i); }
+
+
+// =============================================================================
+// FUNCTION: index_ordering
+// =============================================================================
+// Description: Determines the correct index ordering for aerosol tracers,
+//              specifically for pre-evaporation resuspension to coarse mode.
+//              Maps species/mode/phase combination to tracer index and type.
+//
+// Parameters:
+//   lspec  [in]  - Index for aerosol number/chem-mass/water-mass
+//   imode  [in]  - Index for aerosol mode
+//   lphase [in]  - Index for phase: 1=interstitial, 2=cloudborne aerosol
+//   mm     [out] - Index of the tracers (-1 if not found)
+//   jnv    [out] - Index for scavcoefnv 3rd dimension
+//   jnummaswtr [out] - Aerosol species type indicator:
+//                      0=number, 1=dry mass, 2=water
+//
+// Performance Note: Contains conditional logic but is O(1)
+// Suggestion: Consider using enum class for jaeronumb/jaeromass/jaerowater
+//             for type safety and readability
 // =============================================================================
 KOKKOS_INLINE_FUNCTION
 void index_ordering(const int lspec, const int imode, const int lphase, int &mm,
@@ -802,7 +1392,54 @@ void index_ordering(const int lspec, const int imode, const int lphase, int &mm,
   }
 }
 
-// =============================================================================
+//=============================================================================
+// FUNCTION: examine_prec_exist
+//=============================================================================
+// Description: Determines whether precipitation exists at a specified vertical
+//              level by integrating precipitation flux from the top of the
+//              atmosphere downward.
+//
+// Physical Background:
+//   Precipitation at any level is the net result of:
+//   - Rain production from stratiform clouds (prain)
+//   - Rain production from convective clouds (cmfdqr)
+//   - Rain evaporation as drops fall (evapr, negative contribution)
+//   
+//   The integral is converted from mass mixing ratio tendency [kg/kg/s]
+//   to mass flux [kg/m²/s] using: flux = tendency * Δp / g
+//
+// Algorithm:
+//   1. Initialize precipitation accumulator to zero at top of atmosphere
+//   2. Loop downward through atmosphere, accumulating net precipitation
+//   3. Compare accumulated flux against threshold
+//   4. Return 1 if precipitation exists, 0 otherwise
+//
+// Parameters:
+//   level_for_precipitation [in] - Target level index to check (0 = TOA)
+//   pdel                    [in] - Pressure thickness of each layer [Pa]
+//   prain                   [in] - Stratiform rain production rate [kg/kg/s]
+//   cmfdqr                  [in] - Convective rain production rate [kg/kg/s]
+//   evapr                   [in] - Rain evaporation rate [kg/kg/s]
+//
+// Returns:
+//   1 - Precipitation exists at the specified level (flux ≥ 1.0e-7 kg/m²/s)
+//   0 - No significant precipitation at the specified level
+//
+// Units:
+//   - Input rates: [kg/kg/s] (mass mixing ratio tendency)
+//   - Pressure: [Pa]
+//   - Internal flux: [kg/m²/s]
+//
+// Performance Notes:
+//   - O(level_for_precipitation) complexity
+//   - Simple arithmetic operations in loop
+//   - Total estimate: ~5-10 cycles per level
+//
+// Suggestions for Improvement:
+//   1. Move threshold to named constant (implemented above)
+//   2. Consider returning bool instead of int for clarity
+//   3. Pre-compute 1/gravit outside loop for efficiency
+//=============================================================================
 KOKKOS_INLINE_FUNCTION
 int examine_prec_exist(const int level_for_precipitation, const Real pdel[],
                        const Real prain[], const Real cmfdqr[],
@@ -835,7 +1472,50 @@ int examine_prec_exist(const int level_for_precipitation, const Real pdel[],
   return isprx;
 }
 
-// =============================================================================
+//=============================================================================
+// FUNCTION: set_f_act_coarse
+//=============================================================================
+// Description: Calculates the mass-weighted activation fraction for coarse
+//              mode aerosols in convective clouds based on the relative
+//              abundances of dust and sea salt.
+//
+// Physical Background:
+//   Different aerosol species have different hygroscopicities and thus
+//   different activation efficiencies in convective clouds:
+//   - Sea salt (NaCl): Highly hygroscopic, activates easily (f = 0.80)
+//   - Mineral dust: Less hygroscopic, activates less efficiently (f = 0.40)
+//   
+//   The effective coarse mode activation fraction is computed as a
+//   mass-weighted average of the species-specific fractions.
+//
+// Algorithm:
+//   1. Initialize default activation fractions for dust and sea salt
+//   2. Calculate updated mass concentrations (current + tendency × dt)
+//   3. If total mass is significant, compute mass-weighted average
+//   4. Otherwise, use default overall coarse mode fraction (0.60)
+//
+// Parameters:
+//   kk                      [in]  - Vertical level index
+//   state_q                 [in]  - Tracer mixing ratios [kg/kg]
+//   ptend_q                 [in]  - Tracer tendencies [kg/kg/s]
+//   dt                      [in]  - Model timestep [s]
+//   f_act_conv_coarse       [out] - Mass-weighted activation fraction [0-1]
+//   f_act_conv_coarse_dust  [out] - Dust activation fraction (0.40) [0-1]
+//   f_act_conv_coarse_nacl  [out] - Sea salt activation fraction (0.80) [0-1]
+//
+// Formula:
+//   f_act = (f_dust × m_dust + f_nacl × m_nacl) / (m_dust + m_nacl)
+//
+// Performance Notes:
+//   - O(1) complexity
+//   - Simple arithmetic with one conditional
+//   - Total estimate: ~20-30 cycles
+//
+// Suggestions for Improvement:
+//   1. Move magic numbers to named constants (implemented above)
+//   2. Add bounds checking for kk in debug builds
+//   3. Consider returning struct instead of multiple output parameters
+//=============================================================================
 KOKKOS_INLINE_FUNCTION
 void set_f_act_coarse(const int kk,
                       const Diagnostics::ColumnTracerView &state_q,
@@ -880,7 +1560,54 @@ void set_f_act_coarse(const int kk,
         (tmpdust + tmpnacl);
 }
 
-// =============================================================================
+
+//=============================================================================
+// FUNCTION: calc_resusp_to_coarse
+//=============================================================================
+// Description: Handles aerosol resuspension from evaporating precipitation,
+//              redirecting resuspended mass to the appropriate coarse mode
+//              species.
+//
+// Physical Background:
+//   When precipitation evaporates before reaching the surface, the aerosol
+//   mass that was scavenged is released back into the atmosphere. This
+//   "resuspension" can return aerosols to:
+//   - Their original mode/species (for coarse mode aerosols)
+//   - Coarse mode (for fine mode aerosols that have grown through processing)
+//   
+//   The mmtoo_prevap_resusp mapping determines where resuspended mass goes.
+//
+// Algorithm:
+//   1. Look up target species index for resuspension (mmtoo)
+//   2. Subtract resuspension from current species tendency
+//   3. If mmtoo > 0, add resuspension to target coarse species accumulator
+//   4. If update_dqdt is true, add accumulated resuspension to tendency
+//
+// Parameters:
+//   mm          [in]    - Current species/tracer index
+//   update_dqdt [in]    - Flag to add accumulated resuspension to tendency
+//                         (false for cloud-borne aerosols, lphase==2)
+//   rcscavt     [in]    - Resuspension rate from convective precip [kg/kg/s]
+//   rsscavt     [in]    - Resuspension rate from stratiform precip [kg/kg/s]
+//   dqdt_tmp    [inout] - Tendency for current aerosol species [kg/kg/s]
+//   rtscavt_sv  [inout] - Resuspension accumulator for coarse mode [kg/kg/s]
+//
+// Mapping Logic (mmtoo_prevap_resusp):
+//   mmtoo > 0:  Resuspension goes to coarse mode species at index mmtoo
+//   mmtoo = -1: Species not simulated (no action needed)
+//   mmtoo = -3: Special handling required (not implemented here)
+//
+// Performance Notes:
+//   - O(1) complexity
+//   - Function call to mmtoo_prevap_resusp (O(1) lookup)
+//   - Simple arithmetic with conditionals
+//   - Total estimate: ~15-25 cycles
+//
+// Suggestions for Improvement:
+//   1. Document mmtoo mapping table in header
+//   2. Add handling for mmtoo == -3 case if needed
+//   3. Consider using enum for mmtoo special values
+//=============================================================================
 KOKKOS_INLINE_FUNCTION
 void calc_resusp_to_coarse(const int mm, const bool update_dqdt,
                            const Real rcscavt, const Real rsscavt,
@@ -918,7 +1645,44 @@ void calc_resusp_to_coarse(const int mm, const bool update_dqdt,
   if (update_dqdt)
     dqdt_tmp += rtscavt_sv[mm];
 }
-// =============================================================================
+
+
+//=============================================================================
+// FUNCTION: calc_sfc_flux
+//=============================================================================
+// Description: Calculates surface flux from vertical integration of layer
+//              tendencies using Kokkos parallel reduction for GPU efficiency.
+//
+// Physical Background:
+//   Surface deposition flux represents the total column-integrated tendency
+//   converted to a surface mass flux. This is used for diagnostics and
+//   mass conservation tracking.
+//
+//   Integration formula:
+//     F_sfc = Σ (tendency[k] × Δp[k] / g)
+//   
+//   This converts from mixing ratio tendency [kg/kg/s] to surface mass
+//   flux [kg/m²/s].
+//
+// Parameters:
+//   team       [in] - Kokkos team handle for parallel execution
+//   layer_tend [in] - Tendency in each vertical layer [kg/kg/s]
+//   pdel       [in] - Pressure thickness of each layer [Pa]
+//   nlev       [in] - Number of vertical levels
+//
+// Returns:
+//   Integrated surface flux [kg/m²/s]
+//
+// Performance Notes:
+//   - O(nlev) complexity, parallelized with Kokkos
+//   - Uses TeamVectorRange for efficient GPU execution
+//   - parallel_reduce handles thread synchronization automatically
+//   - Total estimate: ~5-10 cycles per level (highly parallelized on GPU)
+//
+// Suggestions for Improvement:
+//   1. Pre-compute 1/gravit if called repeatedly with same gravity
+//   2. Consider fusing multiple flux calculations if needed together
+//=============================================================================
 using View1D = DeviceType::view_1d<Real>;
 KOKKOS_INLINE_FUNCTION
 Real calc_sfc_flux(const ThreadTeam &team, const View1D &layer_tend,
@@ -942,32 +1706,63 @@ Real calc_sfc_flux(const ThreadTeam &team, const View1D &layer_tend,
   return scratch;
 }
 
-// =============================================================================
+
+//=============================================================================
+// FUNCTION: apportion_sfc_flux_deep
+//=============================================================================
+// Description: Apportions convective surface fluxes between deep and shallow
+//              convection based on precipitation production and evaporation
+//              characteristics of each convection type.
+//
+// Physical Background:
+//   Convective wet removal can occur in both deep and shallow convective
+//   systems. For diagnostic purposes, we need to partition the total
+//   convective flux between these two types.
+//
+//   Assumptions:
+//   1. Below-cloud removal (sflxbc) is proportional to precipitation production
+//      → Uses deep fraction of total precipitation
+//   2. Resuspension (sflxec) is proportional to (removal) × (evap/production)
+//      → Accounts for higher evaporation in shallow convection
+//
+// Algorithm:
+//   1. Calculate deep fraction of total precipitation production
+//   2. Apportion below-cloud flux by precipitation fraction
+//   3. Calculate resuspension efficiency for deep and shallow
+//   4. Apportion evaporation flux by relative resuspension rates
+//
+// Parameters:
+//   rprddpsum  [in]  - Column-integrated deep precip production [kg/m²/s]
+//   rprdshsum  [in]  - Column-integrated shallow precip production [kg/m²/s]
+//   evapcdpsum [in]  - Column-integrated deep precip evaporation [kg/m²/s]
+//   evapcshsum [in]  - Column-integrated shallow precip evaporation [kg/m²/s]
+//   sflxbc     [in]  - Total below-cloud scavenging surface flux [kg/m²/s]
+//   sflxec     [in]  - Total resuspension surface flux [kg/m²/s]
+//   sflxbcdp   [out] - Deep convection below-cloud flux [kg/m²/s]
+//   sflxecdp   [out] - Deep convection resuspension flux [kg/m²/s]
+//
+// Notes:
+//   - Only applies to interstitial aerosols (convective clouds don't affect
+//     stratiform cloud-borne aerosols)
+//   - This is an approximate method adequate for diagnostics since deep and
+//     shallow convection rarely occur simultaneously
+//   - More accurate partitioning could be done in wetdepa subroutine
+//
+// Performance Notes:
+//   - O(1) complexity
+//   - Multiple divisions and max/min operations
+//   - Total estimate: ~30-50 cycles
+//
+// Suggestions for Improvement:
+//   1. Move small_value constants to namespace scope (implemented above)
+//   2. Document why different thresholds are used for precip vs evap
+//   3. Consider struct return type for output pair
+//=============================================================================
 KOKKOS_INLINE_FUNCTION
 void apportion_sfc_flux_deep(const Real rprddpsum, const Real rprdshsum,
                              const Real evapcdpsum, const Real evapcshsum,
                              const Real sflxbc, const Real sflxec,
                              Real &sflxbcdp, Real &sflxecdp) {
-  // clang-format off
-  // -----------------------------------------------------------------------
-  //  apportion convective surface fluxes to deep and shallow conv
-  //  this could be done more accurately in subr wetdepa
-  //  since deep and shallow rarely occur simultaneously, and these
-  //  fields are just diagnostics, this approximate method is adequate
-  //  only do this for interstitial aerosol, because conv clouds to not
-  //  affect the stratiform-cloudborne aerosol
-  // -----------------------------------------------------------------------
-  /*
-  in :: rprddpsum  ! vertical integration of deep rain production [kg/m2/s]
-  in :: rprdshsum  ! vertical integration of shallow rain production [kg/m2/s]
-  in :: evapcdpsum ! vertical integration of deep rain evaporation [kg/m2/s]
-  in :: evapcshsum ! vertical integration of shallow rain evaporation [kg/m2/s]
-  in :: sflxbc     ! surface flux of resuspension from bcscavt [kg/m2/s]
-  in :: sflxec     ! surface flux of resuspension from rcscavt [kg/m2/s]
-  out:: sflxbcdp   ! surface flux of resuspension from bcscavt in deep conv. [kg/m2/s]
-  out:: sflxecdp   ! surface flux of resuspension from rcscavt in deep conv. [kg/m2/s]
-  */
-  // clang-format on
 
   // BAD CONSTANT
   Real small_value_35 = 1.0e-35;

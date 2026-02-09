@@ -1,0 +1,10 @@
+#!/bin/csh 
+
+git pull 
+
+git add * 
+git commit -m "update" 
+
+git push origin kaizhangpnl/mam4xx/markc
+
+
