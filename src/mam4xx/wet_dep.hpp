@@ -50,6 +50,8 @@ using View1D = DeviceType::view_1d<Real>;
 using Int1D = DeviceType::view_1d<int>;
 using View2D = DeviceType::view_2d<Real>;
 using View2DHost = typename HostType::view_2d<Real>;
+
+
 KOKKOS_INLINE_FUNCTION
 void local_precip_production(Real pdel, Real source_term, Real sink_term,
                              Real gravity, Real &result) {

@@ -214,6 +214,56 @@ KOKKOS_INLINE_FUNCTION AeroSpecies aero_species(const int i) {
   return species[i];
 }
 
+//=============================================================================
+// FUNCTION: mode_aero_species
+//=============================================================================
+// Description: Returns the aerosol species identifier (AeroId) for a given
+//              species slot within a specified aerosol mode.
+//
+// Physical Background:
+//   MAM4 organizes aerosol species into four modes based on particle size
+//   and source characteristics. Each mode contains a specific subset of
+//   the seven possible aerosol species, reflecting the physical processes
+//   that form and transform aerosols in each size range.
+//
+// Mode-Species Distribution:
+//   ┌─────────────────┬───────────────────────────────────────────────────────┐
+//   │ Mode            │ Species (in order)                                    │
+//   ├─────────────────┼───────────────────────────────────────────────────────┤
+//   │ 0: Accumulation │ SO4, POM, SOA, BC, DST, NaCl, MOM  (7 species)        │
+//   │ 1: Aitken       │ SO4, SOA, NaCl, MOM, None, None, None (4 species)     │
+//   │ 2: Coarse       │ DST, NaCl, SO4, BC, POM, SOA, MOM  (7 species)        │
+//   │ 3: PrimaryCarbon│ POM, BC, MOM, None, None, None, None (3 species)      │
+//   └─────────────────┴───────────────────────────────────────────────────────┘
+//
+// Parameters:
+//   modeNo    [in] - Mode index (0-3, corresponding to ModeIndex enum)
+//   speciesNo [in] - Species slot index within the mode (0-6)
+//
+// Returns:
+//   AeroId enum value for the species at that slot
+//   AeroId::None if the slot is unused (species count < 7 for that mode)
+//
+// Usage Example:
+//   AeroId species = mode_aero_species(0, 4);  // Returns AeroId::DST (dust in accum)
+//   AeroId species = mode_aero_species(1, 5);  // Returns AeroId::None (unused slot)
+//
+// Performance Notes:
+//   - O(1) array lookup
+//   - Static constexpr array: zero initialization cost at runtime
+//   - Total estimate: ~2-5 cycles
+//
+// Suggestions for Improvement:
+//   1. Add bounds checking for modeNo and speciesNo in debug builds
+//   2. Consider using ModeIndex enum instead of raw integer
+//   3. Rename local array to avoid shadowing function name
+//
+// Related Functions:
+//   - num_species_mode(): Returns count of active species per mode
+//   - aerosol_index_for_mode(): Finds species index within a mode
+//   - mode_contains_species(): Checks if mode contains a species
+//   - lmassptr_amode(): Returns tracer array index for species mass
+//=============================================================================
 // A list of species within each mode for MAM4.
 KOKKOS_INLINE_FUNCTION AeroId mode_aero_species(const int modeNo,
                                                 const int speciesNo) {
@@ -240,14 +290,78 @@ KOKKOS_INLINE_FUNCTION AeroId mode_aero_species(const int modeNo,
        AeroId::None, AeroId::None}};
   return mode_aero_species[modeNo][speciesNo];
 }
-/// Returns number of species per mode
+
+//=============================================================================
+// FUNCTION: num_species_mode
+//=============================================================================
+// Description: Returns the number of active (non-None) aerosol species
+//              in the specified mode.
+//
+// Purpose:
+//   Used to determine loop bounds when iterating over species within a mode,
+//   avoiding unnecessary iterations over AeroId::None slots.
+//
+// Parameter:
+//   i [in] - Mode index (0-3)
+//
+// Returns:
+//   Number of active species in the mode (3, 4, or 7)
+//
+// Usage Example:
+//   for (int s = 0; s < num_species_mode(imode); ++s) {
+//       AeroId species = mode_aero_species(imode, s);
+//       // Process species...
+//   }
+//
+// Performance Notes:
+//   - O(1) array lookup
+//   - Static constexpr: zero runtime initialization cost
+//
+// Related:
+//   - Used by index_ordering() to determine species type (mass vs number)
+//   - nspec_amode in Fortran equivalent
+//=============================================================================
 KOKKOS_INLINE_FUNCTION int num_species_mode(const int i) {
   static constexpr int _num_species_mode[4] = {7, 4, 7, 3};
   return _num_species_mode[i];
 }
 
-/// Returns the index of the given aerosol species within the given mode, or
-/// -1 if the species is not found within the mode.
+
+//=============================================================================
+// FUNCTION: aerosol_index_for_mode
+//=============================================================================
+// Description: Finds the index position of a given aerosol species within
+//              a specified mode's species list.
+//
+// Purpose:
+//   Maps from a species identifier (AeroId) to its position within a mode,
+//   which is needed for accessing mode-specific species arrays.
+//
+// Algorithm:
+//   Linear search through the mode's species list (max 7 iterations)
+//
+// Parameters:
+//   mode    [in] - ModeIndex enum value (Accumulation, Aitken, Coarse, PrimaryCarbon)
+//   aero_id [in] - AeroId enum value of the species to find
+//
+// Returns:
+//   Index (0-6) of the species within the mode if found
+//   -1 if the species is not present in the mode
+//
+// Usage Example:
+//   int idx = aerosol_index_for_mode(ModeIndex::Coarse, AeroId::DST);  // Returns 0
+//   int idx = aerosol_index_for_mode(ModeIndex::Aitken, AeroId::BC);   // Returns -1
+//
+// Performance Notes:
+//   - O(n) linear search where n ≤ 7
+//   - Worst case: 7 comparisons
+//   - Consider binary search or hash map if called frequently
+//
+// Suggestions for Improvement:
+//   1. Use num_species_mode() as loop bound instead of hardcoded 7
+//   2. Consider precomputed inverse lookup table for O(1) access
+//   3. Add early termination when AeroId::None is encountered
+//=============================================================================
 KOKKOS_INLINE_FUNCTION
 int aerosol_index_for_mode(ModeIndex mode, AeroId aero_id) {
   int mode_index = static_cast<int>(mode);
@@ -258,14 +372,91 @@ int aerosol_index_for_mode(ModeIndex mode, AeroId aero_id) {
   }
   return -1;
 }
-/// Convenient function that returns bool indicating if species is
-/// within mode.
+
+
+//=============================================================================
+// FUNCTION: mode_contains_species
+//=============================================================================
+// Description: Convenience function to check whether a mode contains a
+//              specific aerosol species.
+//
+// Purpose:
+//   Provides a boolean interface for species membership queries, which is
+//   more readable than checking aerosol_index_for_mode() != -1.
+//
+// Parameters:
+//   mode    [in] - ModeIndex enum value
+//   aero_id [in] - AeroId enum value to check
+//
+// Returns:
+//   true  - Species is present in the mode
+//   false - Species is not present in the mode
+//
+// Usage Example:
+//   if (mode_contains_species(ModeIndex::Aitken, AeroId::BC)) {
+//       // This branch is NOT taken (BC not in Aitken mode)
+//   }
+//
+// Species Presence Matrix:
+//   ┌─────────┬───────┬────────┬────────┬─────────────────┐
+//   │ Species │ Accum │ Aitken │ Coarse │ Primary Carbon  │
+//   ├─────────┼───────┼────────┼────────┼─────────────────┤
+//   │ SO4     │  ✓    │   ✓    │   ✓    │       ✗         │
+//   │ POM     │  ✓    │   ✗    │   ✓    │       ✓         │
+//   │ SOA     │  ✓    │   ✓    │   ✓    │       ✗         │
+//   │ BC      │  ✓    │   ✗    │   ✓    │       ✓         │
+//   │ DST     │  ✓    │   ✗    │   ✓    │       ✗         │
+//   │ NaCl    │  ✓    │   ✓    │   ✓    │       ✗         │
+//   │ MOM     │  ✓    │   ✓    │   ✓    │       ✓         │
+//   └─────────┴───────┴────────┴────────┴─────────────────┘
+//
+//=============================================================================
 KOKKOS_INLINE_FUNCTION
 bool mode_contains_species(ModeIndex mode, AeroId aero_id) {
   return -1 != aerosol_index_for_mode(mode, aero_id);
 }
 
-// Identifiers for gas species in MAM4
+
+//=============================================================================
+// ENUM CLASS: GasId
+//=============================================================================
+// Description: Identifiers for gas-phase species tracked in MAM4.
+//              These gases participate in aerosol formation, growth,
+//              and chemical transformations.
+//
+// Gas Species Overview:
+//   ┌─────────┬────────────────────────┬─────────────────────────────────────┐
+//   │ GasId   │ Name                   │ Role in Aerosol Processes           │
+//   ├─────────┼────────────────────────┼─────────────────────────────────────┤
+//   │ O3      │ Ozone                  │ Oxidant for SO2, DMS, VOCs          │
+//   │ H2O2    │ Hydrogen Peroxide      │ Aqueous-phase oxidant for SO2       │
+//   │ H2SO4   │ Sulfuric Acid          │ Nucleation, condensation growth     │
+//   │ SO2     │ Sulfur Dioxide         │ Precursor to sulfate aerosol        │
+//   │ DMS     │ Dimethyl Sulfide       │ Marine SO2 precursor                │
+//   │ SOAG    │ SOA Precursor Gas      │ Lumped VOC oxidation products       │
+//   │ None    │ Invalid/Placeholder    │ Array padding, error checking       │
+//   └─────────┴────────────────────────┴─────────────────────────────────────┘
+//
+// Chemical Pathways:
+//
+//   DMS (ocean) → SO2 → H2SO4 → Sulfate aerosol (SO4)
+//                  ↑        ↓
+//                 O3     Nucleation (new particles)
+//                  ↓        ↓
+//                H2O2   Condensation (growth)
+//                  ↓
+//            Aqueous oxidation (in-cloud)
+//
+//   VOCs → SOAG → SOA (secondary organic aerosol)
+//
+// Integer Values:
+//   Used for array indexing into gas tracer arrays
+//   Values 0-5 are valid; 6 (None) indicates invalid/unused
+//
+// Usage Example:
+//   int idx = static_cast<int>(GasId::H2SO4);  // Returns 2
+//   Real h2so4_conc = gas_mixing_ratios[static_cast<int>(GasId::H2SO4)];
+//=============================================================================
 enum class GasId {
   O3 = 0,    // ozone
   H2O2 = 1,  // hydrogen peroxide
@@ -275,6 +466,7 @@ enum class GasId {
   SOAG = 5,  // secondary organic aerosol precursor
   None = 6,  // invalid gas id
 };
+
 
 /// Molecular weight of carbon dioxide [kg/mol]
 static constexpr Real molec_weight_co2 = 0.0440095;
@@ -297,6 +489,76 @@ static constexpr Real molec_weight_o3 = 0.0479982;
 /// Molecular weight of sulfur dioxide @f$\text{SO}_2@f$
 static constexpr Real molec_weight_so2 = 0.06407;
 
+
+//=============================================================================
+// FUNCTION: gas_species
+//=============================================================================
+// Description: Returns the GasSpecies structure containing molecular weight
+//              and other properties for the specified gas species index.
+//
+// Physical Background:
+//   MAM4 tracks multiple gas-phase species that participate in:
+//   - Aerosol nucleation (H₂SO₄)
+//   - Aerosol growth by condensation (H₂SO₄, SOAG)
+//   - Oxidation chemistry (O₃, H₂O₂, OH)
+//   - Sulfur cycle (SO₂, DMS, H₂SO₄)
+//   - Climate forcing (CO₂, CH₄, N₂O, CFCs)
+//
+// Gas Species List (13 total):
+//   ┌───────┬─────────────────────────────┬────────────────┬──────────────────┐
+//   │ Index │ Species                     │ Formula        │ MW [kg/mol]      │
+//   ├───────┼─────────────────────────────┼────────────────┼──────────────────┤
+//   │   0   │ Ozone                       │ O₃             │ 0.0479982        │
+//   │   1   │ Hydrogen peroxide           │ H₂O₂           │ 0.034015         │
+//   │   2   │ Sulfuric acid               │ H₂SO₄          │ 0.098079         │
+//   │   3   │ Sulfur dioxide              │ SO₂            │ 0.06407          │
+//   │   4   │ Dimethylsulfide             │ (CH₃)₂S        │ 0.06214          │
+//   │   5   │ SOA precursor gas           │ (lumped)       │ ~0.012 (carbon)  │
+//   │   6   │ Oxygen                      │ O₂             │ 0.0319988        │
+//   │   7   │ Carbon dioxide              │ CO₂            │ 0.0440095        │
+//   │   8   │ Nitrous oxide               │ N₂O            │ 0.044013         │
+//   │   9   │ Methane                     │ CH₄            │ 0.0160425        │
+//   │  10   │ Trichlorofluoromethane      │ CCl₃F (CFC-11) │ 0.13736          │
+//   │  11   │ Dichlorofluoromethane       │ CHCl₂F         │ 0.10292          │
+//   │  12   │ Ammonia                     │ NH₃            │ 0.017031         │
+//   └───────┴─────────────────────────────┴────────────────┴──────────────────┘
+//
+// Correspondence to GasId enum (first 6 species):
+//   Index 0 → GasId::O3
+//   Index 1 → GasId::H2O2
+//   Index 2 → GasId::H2SO4
+//   Index 3 → GasId::SO2
+//   Index 4 → GasId::DMS
+//   Index 5 → GasId::SOAG
+//
+// Parameter:
+//   i [in] - Gas species index (0-12)
+//
+// Returns:
+//   GasSpecies structure containing molecular weight [kg/mol]
+//
+// Usage Example:
+//   GasSpecies so2 = gas_species(3);
+//   Real mw_so2 = so2.molecular_weight;  // 0.06407 kg/mol
+//
+// Performance Notes:
+//   - O(1) array lookup
+//   - Static array: initialized once at first call
+//   - Total estimate: ~2-5 cycles
+//
+// Suggestions for Improvement:
+//   1. Add bounds checking for index i in debug builds
+//   2. Consider using GasId enum instead of raw integer for type safety
+//   3. Ensure species ordering matches GasId enum values
+//   4. Move static array to namespace scope as constexpr if GasSpecies is literal
+//   5. Fix typo in comment: "thrichlorofluoromethane" → "trichlorofluoromethane"
+//
+// Related:
+//   - GasId enum for gas species identification
+//   - Constants::molec_weight_h2so4 for sulfuric acid
+//   - Constants::molec_weight_nh3 for ammonia
+//   - Constants::molec_weight_c for carbon (used for SOAG)
+//=============================================================================
 /// A list of gas species in MAM4.
 KOKKOS_INLINE_FUNCTION GasSpecies gas_species(const int i) {
   static const GasSpecies species[13] = {
