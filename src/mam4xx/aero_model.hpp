@@ -22,15 +22,53 @@ namespace mam4 {
 namespace aero_model {
 
 // BAD CONSTANT
+// index range for the impaction scavenging lookup table based on hygroscopic growth factors.
 constexpr int nimptblgrow_mind = -7, nimptblgrow_maxd = 12;
+// total number of entries in the lookup table:
 constexpr int nimptblgrow_total = -nimptblgrow_mind + nimptblgrow_maxd + 1;
-const int nrainsvmax = 50; // maximum bin number for rain
-const int naerosvmax = 51; //  maximum bin number for aerosol
+// Maximum number of rain drop size bins for discretizing the Marshall-Palmer rain drop size distribution
+const int nrainsvmax = 50; 
+// Maximum number of aerosol size bins for discretizing the log-normal aerosol size distribution
+const int naerosvmax = 51; 
+// Maximum number of aerosol species types per mode.
 const int maxd_aspectype = 14;
 
 constexpr int pcnst = mam4::pcnst;
+
+//=============================================================================
+// Example: 
+// 
+// ┌─────────────────────────────────────────────────────────────┐
+// │                         HOST (CPU)                          │
+// │                                                             │
+// │   modal_aero_bcscavcoef_init()                              │
+// │   ┌─────────────────────────────────┐                       │
+// │   │  View2DHost scavimptblnum       │  ← Initialized here   │
+// │   │  View2DHost scavimptblvol       │                       │
+// │   └─────────────────────────────────┘                       │
+// │                    │                                        │
+// │                    │ Kokkos::deep_copy()                    │
+// │                    ▼                                        │
+// └─────────────────────────────────────────────────────────────┘
+//                      │
+//                      ▼
+// ┌─────────────────────────────────────────────────────────────┐
+// │                        DEVICE (GPU)                         │
+// │                                                             │
+// │   modal_aero_bcscavcoef_get()                               │
+// │   ┌─────────────────────────────────┐                       │
+// │   │  View2D scavimptblnum           │  ← Used here          │
+// │   │  View2D scavimptblvol           │                       │
+// │   └─────────────────────────────────┘                       │
+// │                                                             │
+// └─────────────────────────────────────────────────────────────┘
+//=============================================================================
+// Creates a type alias View2D for a 2D Kokkos View that resides in device memory (GPU).
 using View2D = DeviceType::view_2d<Real>;
+// Creates a type alias View2DHost for a 2D Kokkos View that resides in host memory (CPU). 
 using View2DHost = typename HostType::view_2d<Real>;
+
+
 
 
 //=============================================================================
