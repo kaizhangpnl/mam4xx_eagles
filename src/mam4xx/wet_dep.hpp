@@ -595,22 +595,98 @@ Real flux_precnum_vs_flux_prec_mpln(const Real flux_prec, const int jstrcnv) {
   return y_var;
 }
 
-// ==============================================================================
+
+//=============================================================================
+// FUNCTION: faer_resusp_vs_fprec_evap_mpln
+//=============================================================================
+// Description: Calculates the fraction of precipitation-borne aerosol flux 
+//              that is resuspended back into the atmosphere based on the 
+//              fraction of precipitation that has evaporated.
+//
+// Physical Background:
+//   When precipitation evaporates before reaching the surface, the aerosol
+//   mass that was scavenged and carried by the precipitation drops is 
+//   released back into the atmosphere (resuspension).
+//
+//   The relationship between evaporated precipitation fraction and aerosol
+//   resuspension fraction is NOT linear because:
+//   1. Smaller drops evaporate faster (higher surface-to-volume ratio)
+//   2. Larger drops carry more aerosol mass per drop
+//   3. The drop size distribution determines the mass-weighted evaporation
+//
+//   This function provides empirical fits for two drop size distributions:
+//   - Marshall-Palmer: Classic exponential distribution
+//   - Log-normal: More flexible distribution
+//
+// Mathematical Form:
+//   For x ≥ x_threshold (polynomial regime):
+//     f_resusp = x × P(x) where P(x) is an 8th-order polynomial
+//     f_resusp = x × (a01 + x×(a02 + x×(a03 + ... + x×a09)))
+//   
+//   For x < x_threshold (linear regime):
+//     f_resusp = y_threshold × (x / x_threshold)
+//   
+//   This ensures smooth behavior near zero and proper limiting behavior.
+//
+// Key Physical Insights:
+//   ┌─────────────────────────────────────────────────────────────────────────┐
+//   │ • f_resusp ≤ f_evap always (can't resuspend more than was scavenged)    │
+//   │ • Relationship is sublinear at low evap fractions                       │
+//   │ • Approaches f_resusp → f_evap as f_evap → 1 (complete evaporation)    │
+//   │ • Larger drops (more mass) are last to fully evaporate                  │
+//   │ • Small drops evaporate first but carry less mass                       │
+//   └─────────────────────────────────────────────────────────────────────────┘
+//
+// Parameters:
+//   fprec_evap [in] - Fraction of precipitation that has evaporated [0-1]
+//                     Computed as: (precip_production - precip_at_surface) / precip_production
+//   jstrcnv    [in] - Distribution type selector:
+//                     ≤ 1: Marshall-Palmer distribution
+//                     > 1: Log-normal distribution
+//
+// Returns:
+//   Fraction of precipitation-borne aerosol flux that is resuspended [0-1]
+//   Note: These fractions are relative to CLOUD-BASE fluxes, not layer-above fluxes
+//
+// Important Note on Reference Frame:
+//   The returned resuspension fraction is relative to the aerosol flux at
+//   cloud base (where scavenging initially occurred), NOT relative to the
+//   flux in the layer immediately above the current level. This distinction
+//   is important for proper mass conservation in the vertical integration.
+//
+// Regime Thresholds:
+//   ┌─────────────────┬───────────────┬───────────────────────────────────────┐
+//   │ Distribution    │ x_threshold   │ Linear regime (x < threshold)         │
+//   ├─────────────────┼───────────────┼───────────────────────────────────────┤
+//   │ Marshall-Palmer │ 0.05 (5%)     │ f = 0.00256 × (x / 0.05)              │
+//   │ Log-normal      │ 0.10 (10%)    │ f = 0.000622 × (x / 0.10)             │
+//   └─────────────────┴───────────────┴───────────────────────────────────────┘
+//
+// Performance Notes:
+//   - O(1) complexity
+//   - Polynomial evaluation using Horner's method (efficient, numerically stable)
+//   - No transcendental functions (exp, log) - only multiplications and additions
+//   - Total estimate: ~30-50 cycles
+//
+// Suggestions for Improvement:
+//   1. Move coefficients to namespace scope as constexpr (implemented above)
+//   2. Consider using arrays and loop for polynomial evaluation
+//   3. Add documentation on how coefficients were derived
+//   4. Consider Chebyshev polynomial for better numerical properties
+//   5. Fix typo: "x_lox_lin" → "x_low_lin" for clarity
+//
+// Usage Context:
+//   Used in wet scavenging calculations to determine how much aerosol mass
+//   returns to the atmosphere when precipitation evaporates. This is critical
+//   for the "pre-evaporation resuspension" process in MAM4.
+//
+// Related Functions:
+//   - flux_precnum_vs_flux_prec_mpln(): Converts mass flux to number flux
+//   - update_scavenging(): Uses resuspension in tendency calculations
+//   - calc_resusp_to_coarse(): Handles resuspension mass transfer to coarse mode
+//=============================================================================
 KOKKOS_INLINE_FUNCTION
 Real faer_resusp_vs_fprec_evap_mpln(const Real fprec_evap, const int jstrcnv) {
-  // clang-format off
-  //  --------------------------------------------------------------------------------
-  //  corresponding fraction of precipitation-borne aerosol flux that is resuspended
-  //  Options of assuming log-normal or marshall-palmer raindrop size distribution
-  //  note that these fractions are relative to the cloud-base fluxes,
-  //  and not to the layer immediately above fluxes
-  //  --------------------------------------------------------------------------------
-  /*
-  in :: fprec_evap ! [fraction]
-  in :: jstrcnv !  current only two options: 1 for marshall-palmer distribution, 2 for log-normal distribution
-  out : faer_resusp_vs_fprec_evap_mpln ! [fraction]
-  */
-  // clang-format on
 
   // current only two options: 1 for marshall-palmer distribution, 2 for
   // log-normal distribution
@@ -666,7 +742,93 @@ Real faer_resusp_vs_fprec_evap_mpln(const Real fprec_evap, const int jstrcnv) {
   return y_var;
 }
 
-//==============================================================================
+
+//=============================================================================
+// FUNCTION: fprecn_resusp_vs_fprec_evap_mpln
+//=============================================================================
+// Description: Calculates the fraction of rain drop NUMBER flux that has
+//              evaporated based on the fraction of precipitation MASS that
+//              has evaporated. This is used in conjunction with aerosol
+//              resuspension calculations.
+//
+// Physical Background:
+//   When precipitation evaporates, both the mass flux and number flux of
+//   rain drops decrease, but at DIFFERENT rates because:
+//   
+//   1. Small drops evaporate FASTER than large drops (higher surface/volume)
+//   2. Small drops are more NUMEROUS but contribute less to total mass
+//   3. Therefore, NUMBER flux decreases faster than MASS flux for partial evap
+//
+//   This function provides the mapping from mass evaporation fraction to
+//   number evaporation fraction for two drop size distributions.
+//
+// Comparison with Aerosol Resuspension Function (faer_resusp_vs_fprec_evap_mpln):
+//   ┌─────────────────────────────────────────────────────────────────────────┐
+//   │ Function                        │ What it calculates                    │
+//   ├─────────────────────────────────┼───────────────────────────────────────┤
+//   │ faer_resusp_vs_fprec_evap_mpln  │ Aerosol MASS resuspension fraction    │
+//   │ fprecn_resusp_vs_fprec_evap_mpln│ Rain NUMBER evaporation fraction      │
+//   └─────────────────────────────────┴───────────────────────────────────────┘
+//
+// Key Physical Insight:
+//   At low mass evaporation fractions:
+//   - Marshall-Palmer: ~17% of drops evaporate when only 5% of mass evaporates
+//   - Log-normal: ~2.7% of drops evaporate when 10% of mass evaporates
+//   
+//   This reflects the different drop size distributions:
+//   - Marshall-Palmer has more small drops (exponential tail toward small sizes)
+//   - Log-normal has a narrower distribution around the geometric mean
+//
+// Mathematical Form:
+//   For x ≥ x_threshold (polynomial regime):
+//     f_precn = x × P(x) where P(x) is an 8th-order polynomial
+//     f_precn = x × (a01 + x×(a02 + x×(a03 + ... + x×a09)))
+//   
+//   For x < x_threshold (linear regime):
+//     f_precn = y_threshold × (x / x_threshold)
+//
+// Parameters:
+//   fprec_evap [in] - Fraction of precipitation MASS that has evaporated [0-1]
+//   jstrcnv    [in] - Distribution type selector:
+//                     ≤ 1: Marshall-Palmer distribution
+//                     > 1: Log-normal distribution
+//
+// Returns:
+//   Fraction of rain drop NUMBER flux that has evaporated [0-1]
+//   Note: These fractions are relative to CLOUD-BASE fluxes, not layer-above
+//
+// Regime Thresholds:
+//   ┌─────────────────┬───────────────┬───────────────────────────────────────┐
+//   │ Distribution    │ x_threshold   │ Linear regime (x < threshold)         │
+//   ├─────────────────┼───────────────┼───────────────────────────────────────┤
+//   │ Marshall-Palmer │ 0.05 (5%)     │ f_n = 0.170 × (x / 0.05)              │
+//   │                 │               │ → 17% number loss at 5% mass loss     │
+//   ├─────────────────┼───────────────┼───────────────────────────────────────┤
+//   │ Log-normal      │ 0.10 (10%)    │ f_n = 0.0272 × (x / 0.10)             │
+//   │                 │               │ → 2.7% number loss at 10% mass loss   │
+//   └─────────────────┴───────────────┴───────────────────────────────────────┘
+//
+// Behavior at Limits:
+//   - f_evap = 0: f_precn = 0 (no evaporation → no drop loss)
+//   - f_evap = 1: f_precn = 1 (complete evaporation → all drops gone)
+//   - f_precn ≥ f_evap for M-P (many small drops evaporate first)
+//   - Relationship is SUPERLINEAR for Marshall-Palmer at low evap fractions
+//
+// Suggestions for Improvement:
+//   1. Move coefficients to namespace scope as constexpr (implemented above)
+//   2. Consider using arrays and loop for polynomial evaluation
+//   3. Document source of regression coefficients
+//   4. Consider validating output is in [0,1] range
+//
+// Usage Context:
+//   Used in wet scavenging calculations to track the evolution of rain drop
+//   number concentration as precipitation evaporates. This affects the
+//   collection efficiency calculations that depend on drop number.
+//
+// Related Functions:
+//   - faer_resusp_vs_fprec_evap_mpln(): Aerosol mass resuspension fraction
+//   - flux_precnum_vs_flux_prec_mpln(): Mass flux to number flux conversion
+//=============================================================================
 KOKKOS_INLINE_FUNCTION
 Real fprecn_resusp_vs_fprec_evap_mpln(const Real fprec_evap,
                                       const int jstrcnv) {
@@ -737,7 +899,66 @@ Real fprecn_resusp_vs_fprec_evap_mpln(const Real fprec_evap,
 
   return y_var;
 }
-// ==============================================================================
+
+
+//=============================================================================
+// FUNCTION: wetdep_prevap
+//=============================================================================
+// Description: Updates precipitation fluxes and scavenged tracer fluxes as
+//              precipitation is produced and falls through a model layer.
+//              This is a key component of the pre-evaporation resuspension
+//              calculation in the wet deposition scheme.
+//
+// Physical Background:
+//   As air descends through the atmosphere, precipitation can be:
+//   1. Produced: New rain forms from cloud condensate (pprdx > 0)
+//   2. Scavenged: Aerosols are collected by falling drops (srcx > 0)
+//   
+//   This function tracks the cumulative precipitation and scavenged aerosol
+//   fluxes through the atmospheric column, which are used later to calculate
+//   resuspension when precipitation evaporates.
+//
+// Two Tracking Modes (based on mam_prevap_resusp_optcc):
+//   ┌─────────────────┬───────────────────────────────────────────────────────┐
+//   │ Option Value    │ Tracking Method                                       │
+//   ├─────────────────┼───────────────────────────────────────────────────────┤
+//   │ ≤ 130           │ Track scavenged AEROSOL MASS flux (scavabx)           │
+//   │                 │ Traditional method, simpler                           │
+//   ├─────────────────┼───────────────────────────────────────────────────────┤
+//   │ > 130           │ Track rain DROP NUMBER flux (precnumx_base)           │
+//   │ (130, 210, 230) │ More physical, accounts for drop size distribution    │
+//   └─────────────────┴───────────────────────────────────────────────────────┘
+//
+// Flux Variables Tracked:
+//   - precabx: Precipitation mass flux at current level [kg/m²/s]
+//   - precabx_base: Precipitation mass flux at cloud base [kg/m²/s]
+//   - scavabx: Scavenged aerosol mass flux (mode ≤130) [kg/m²/s]
+//   - precnumx_base: Rain drop number flux at cloud base (mode >130) [#/m²/s]
+//
+// Algorithm:
+//   1. Convert precipitation production from tendency [kg/kg/s] to flux [kg/m²/s]
+//   2. Update precipitation flux at cloud base (cumulative maximum)
+//   3. Update precipitation flux at current level (bounded by base flux)
+//   4. Depending on resuspension option:
+//      a) Mode ≤130: Update scavenged aerosol flux
+//      b) Mode >130: Update rain number flux using drop size distribution
+//
+// Parameters:
+//   is_st_cu              [in]  - Cloud type for drop size distribution:
+//                                 1 = Stratiform (Marshall-Palmer)
+//                                 2 = Convective (Log-normal)
+//   mam_prevap_resusp_optcc [in] - Resuspension calculation option:
+//                                 ≤130: Track aerosol mass flux
+//                                 >130: Track rain number flux
+//   pdel_ik               [in]  - Pressure thickness of layer [Pa]
+//   pprdx                 [in]  - Precipitation production rate [kg/kg/s]
+//   srcx                  [in]  - Scavenging tendency [kg/kg/s]
+//   arainx                [in]  - Precipitating/cloudy volume fraction [0-1]
+//   precabx_old           [in]  - Input precip flux above this layer [kg/m²/s]
+//   precabx_base_old      [in]  - Input precip flux at cloud base [kg/m²/s]
+//   scavabx_old           [in]  - Input scavenged tracer flux [kg/m²/s]
+//   precnumx_base_old     [in]  - Input rain number flux at base [#/m²/s]
+//=============================================================================
 KOKKOS_INLINE_FUNCTION
 void wetdep_prevap(const int is_st_cu, const int mam_prevap_resusp_optcc,
                    const Real pdel_ik, const Real pprdx, const Real srcx,
@@ -771,6 +992,7 @@ void wetdep_prevap(const int is_st_cu, const int mam_prevap_resusp_optcc,
   out :: precnumx_base_new ! output of rain number at cloud base [#/m2/s]
   */
   // clang-format on
+  
   // BAD CONSTANT
   const Real small_value_30 = 1.e-30;
   const Real gravit = Constants::gravity;
@@ -803,7 +1025,93 @@ void wetdep_prevap(const int is_st_cu, const int mam_prevap_resusp_optcc,
     }
   }
 }
+
+
 // ==============================================================================
+//  FUNCTION: wetdep_resusp_nonlinear
+// ==============================================================================
+//
+//  PURPOSE:
+//    Perform nonlinear resuspension of aerosol mass or number during wet
+//    deposition. This function calculates how much aerosol that was previously
+//    scavenged by precipitation is re-released (resuspended) back into the
+//    atmosphere due to raindrop evaporation.
+//
+//  DESCRIPTION:
+//    The resuspension calculation depends on the cloud type (stratiform vs
+//    convective) because raindrop size distributions differ:
+//      - Stratiform clouds: Marshall-Palmer distribution
+//      - Convective clouds: Log-normal distribution
+//
+//    Two modes of operation are supported based on mam_prevap_resusp_optcc:
+//      - optcc <= 130: Mass-based resuspension using aerosol mass fractions
+//      - optcc >  130: Number-based resuspension using raindrop number
+//
+//  ALGORITHM:
+//    1. Calculate old precipitation fraction (u_old = precabx_old / precabx_base_old)
+//    2. Compute aerosol/number retention fraction (x_old) using lookup functions
+//    3. Calculate new precipitation fraction (u_new = precabx_new / precabx_base_old)
+//    4. Compute new retention fraction (x_new)
+//    5. Determine resuspension as the difference in scavenged amounts
+//
+//  INPUT PARAMETERS:
+//    is_st_cu              [int]   - Cloud type flag:
+//                                      1 = stratiform (Marshall-Palmer distribution)
+//                                      2 = convective (log-normal distribution)
+//    mam_prevap_resusp_optcc [int] - Resuspension option control:
+//                                      <= 130: mass-based resuspension
+//                                      >  130: number-based resuspension
+//    precabx_old           [Real]  - Precipitation flux above this layer (old) [kg/m2/s]
+//    precabx_base_old      [Real]  - Precipitation flux at cloud base (old)    [kg/m2/s]
+//    scavabx_old           [Real]  - Scavenged tracer flux from above (old)    [kg/m2/s]
+//    precnumx_base_old     [Real]  - Precipitation number flux at cloud base   [#/m2/s]
+//    precabx_new           [Real]  - Precipitation flux above this layer (new) [kg/m2/s]
+//
+//  OUTPUT PARAMETERS:
+//    scavabx_new           [Real]  - Updated scavenged tracer flux             [kg/m2/s]
+//    resusp_x              [Real]  - Aerosol mass/number resuspended in layer  [kg/m2/s or #/m2/s]
+//
+//  COMPUTATIONAL PERFORMANCE ESTIMATE:
+//    - ~10-20 floating point operations (divisions, multiplications, comparisons)
+//    - 1-2 calls to transcendental functions via faer_resusp_vs_fprec_evap_mpln
+//      or fprecn_resusp_vs_fprec_evap_mpln (these may contain pow/exp operations)
+//    - Multiple branch divergences due to conditionals (may affect GPU performance)
+//    - Memory: No significant memory operations; all stack-based
+//
+//  SUGGESTIONS FOR IMPROVEMENT:
+//    1. READABILITY:
+//       - Consider splitting into two separate functions for mass vs number
+//         resuspension to reduce branching complexity
+//       - Use named constants or enums for magic numbers (130, cloud types 1/2)
+//       - Variable naming: 'x_old', 'x_new', 'u_old', 'u_new' are cryptic;
+//         consider more descriptive names like 'retention_frac_old'
+//
+//    2. RELIABILITY:
+//       - Add assertion or guard for precabx_base_old > 0 to prevent division by zero
+//       - Consider validating input ranges at function entry in debug builds
+//       - The constant small_value_30 (1e-30) should be defined globally or
+//         use a standard epsilon value
+//
+//    3. EFFICIENCY:
+//       - The repeated calls to min_max_bound could be consolidated
+//       - Consider using branchless operations where possible for GPU vectorization
+//       - The conditional (mam_prevap_resusp_optcc <= 130) is evaluated multiple
+//         times; consider using a template parameter or function pointer
+//       - Cache common subexpressions like (1.0 - u_old) and (1.0 - u_new)
+//
+//  POTENTIAL BUGS/CONCERNS:
+//    1. DIVISION BY ZERO: If precabx_base_old is zero or very small, the division
+//       precabx_old / precabx_base_old may cause numerical issues. The min_max_bound
+//       clamps the result, but inf/nan could propagate before clamping.
+//       RECOMMENDATION: Add explicit check for precabx_base_old > small_value
+//
+//    2. OUTPUT INCONSISTENCY: When mam_prevap_resusp_optcc > 130, scavabx_new is
+//       set to 0, which may not be the intended behavior if the caller expects
+//       it to reflect the actual scavenged amount. Verify this is intentional.
+//
+//    3. UNUSED PARAMETER: In the number-based branch (optcc > 130), scavabx_old
+//       is not used but is still a required input parameter.
+//
 // ==============================================================================
 KOKKOS_INLINE_FUNCTION
 void wetdep_resusp_nonlinear(
@@ -812,26 +1120,6 @@ void wetdep_resusp_nonlinear(
     const Real precnumx_base_old, const Real precabx_new, Real &scavabx_new,
     Real &resusp_x) {
 
-  // clang-format off
-  //  ------------------------------------------------------------------------------
-  //  do nonlinear resuspension of aerosol mass or number
-  //  ------------------------------------------------------------------------------
-  /*
-   in :: is_st_cu      ! options for stratiform (1) or convective (2) clouds
-                       ! raindrop size distribution is
-                       ! different for different cloud:
-                       ! 1: assume marshall-palmer distribution
-                       ! 2: assume log-normal distribution
-   in :: mam_prevap_resusp_optcc       ! suspension options
-   in :: precabx_base_old ! input of precipitation at cloud base [kg/m2/s]
-   in :: precabx_old  ! input of precipitation above this layer [kg/m2/s]
-   in :: scavabx_old  ! input scavenged tracer flux from above [kg/m2/s]
-   in :: precnumx_base_old ! precipitation number at cloud base [#/m2/s]
-   in :: precabx_new  ! output of precipitation above this layer [kg/m2/s]
-   out :: scavabx_new ! output scavenged tracer flux from above [kg/m2/s]
-   out :: resusp_x    ! aerosol mass re-suspension in a particular layer [kg/m2/s]
-  */
-  // clang-format on
 
   // BAD CONSTANT
   const Real small_value_30 = 1.e-30;
@@ -881,8 +1169,79 @@ void wetdep_resusp_nonlinear(
     resusp_x = haero::max(0.0, precnumx_base_old * (x_old - x_new));
   }
 }
-// ==============================================================================
-// ==============================================================================
+
+
+
+// =============================================================================
+// FUNCTION: wetdep_resusp_noprecip
+// =============================================================================
+// PURPOSE:
+//   Performs complete resuspension of scavenged aerosol when precipitation 
+//   rate drops to zero. This function handles the case where rain has completely
+//   evaporated, releasing previously scavenged aerosol particles back into the
+//   atmosphere.
+//
+// PHYSICS:
+//   When precipitation evaporates completely, aerosol particles that were
+//   scavenged by the raindrops are released back into the air. The resuspension
+//   can be calculated using either:
+//   - Linear method: All scavenged mass is resuspended (mam_prevap_resusp_optcc <= 130)
+//   - Non-linear method: Resuspension based on raindrop number using Marshall-Palmer
+//     or log-normal distributions depending on cloud type
+//
+// INPUT PARAMETERS:
+//   is_st_cu             - Cloud type indicator:
+//                          1: Stratiform clouds (Marshall-Palmer raindrop distribution)
+//                          2: Convective clouds (log-normal raindrop distribution)
+//   mam_prevap_resusp_optcc - Resuspension method option:
+//                          <= 130: Linear resuspension (mass-based)
+//                          >  130: Non-linear resuspension (number-based)
+//   precabx_old          - Precipitation rate above this layer [kg/m2/s]
+//   precabx_base_old     - Precipitation rate at cloud base [kg/m2/s]
+//   scavabx_old          - Scavenged tracer flux from above [kg/m2/s]
+//   precnumx_base_old    - Precipitation number flux at cloud base [#/m2/s]
+//
+// OUTPUT PARAMETERS:
+//   precabx_new          - Updated precipitation rate (set to 0) [kg/m2/s]
+//   precabx_base_new     - Updated cloud base precipitation (set to 0) [kg/m2/s]
+//   scavabx_new          - Updated scavenged tracer flux [kg/m2/s]
+//   resusp_x             - Resuspended aerosol flux in this layer [kg/m2/s or #/m2/s]
+//
+// COMPUTATIONAL PERFORMANCE ESTIMATE:
+//   - Complexity: O(1) - constant time operations
+//   - Main cost: One call to fprecn_resusp_vs_fprec_evap_mpln() in non-linear branch
+//   - Branch divergence: Two main branches based on mam_prevap_resusp_optcc
+//   - Memory access: All scalar operations, no array access
+//   - Estimated cycles: ~50-100 cycles depending on branch taken
+//
+// SUGGESTIONS FOR IMPROVEMENT:
+//   1. READABILITY:
+//      - Consider using an enum for is_st_cu (e.g., STRATIFORM=1, CONVECTIVE=2)
+//      - Consider using an enum or named constant for the 130 threshold
+//      - Variable names could be more descriptive (e.g., precabx -> precip_above_layer)
+//
+//   2. RELIABILITY:
+//      - Add assertions or bounds checking for is_st_cu (should be 1 or 2)
+//      - Consider checking for NaN inputs in debug builds
+//      - The constant 'small_value_30' should be defined at module scope
+//
+//   3. EFFICIENCY:
+//      - The non-linear branch computes x_old and x_new, but x_new is always 0.0
+//        This suggests the computation could be simplified
+//      - Consider early return after linear branch to avoid setting precabx values
+//        (though compiler likely optimizes this)
+//
+// POTENTIAL BUGS/CONCERNS:
+//   1. In the non-linear branch (mam_prevap_resusp_optcc > 130), scavabx_new is 
+//      NOT explicitly set, meaning it retains whatever value it had on entry.
+//      This may be intentional but could lead to unexpected behavior if the caller
+//      expects it to be updated.
+//
+//   2. The 'x_new = 0.0' assignment is redundant since it's a const declaration.
+//      This appears to be placeholder code or the formula (x_old - x_new) could
+//      be simplified to just x_old.
+//
+// =============================================================================
 KOKKOS_INLINE_FUNCTION
 void wetdep_resusp_noprecip(const int is_st_cu,
                             const int mam_prevap_resusp_optcc,
@@ -891,27 +1250,7 @@ void wetdep_resusp_noprecip(const int is_st_cu,
                             const Real precnumx_base_old, Real &precabx_new,
                             Real &precabx_base_new, Real &scavabx_new,
                             Real &resusp_x) {
-  // clang-format off
-  // ------------------------------------------------------------------------------
-  // do complete resuspension when precipitation rate is zero
-  // ------------------------------------------------------------------------------
-  /*
-  in :: is_st_cu      ! options for stratiform (1) or convective (2) clouds
-                      ! raindrop size distribution is
-                      ! different for different cloud:
-                      ! 1: assume marshall-palmer distribution
-                      ! 2: assume log-normal distribution
-  in :: mam_prevap_resusp_optcc       ! suspension options
-  in :: precabx_base_old ! input of precipitation at cloud base [kg/m2/s]
-  in :: precabx_old ! input of precipitation above this layer [kg/m2/s]
-  in :: scavabx_old ! input of scavenged tracer flux from above [kg/m2/s]
-  in :: precnumx_base_old ! precipitation number at cloud base [#/m2/s]
-  out :: precabx_base_new ! output of precipitation at cloud base [kg/m2/s]
-  out :: precabx_new ! output of precipitation above this layer [kg/m2/s]
-  inout :: scavabx_new ! output of scavenged tracer flux from above [kg/m2/s]
-  out :: resusp_x    ! aerosol mass re-suspension in a particular layer [kg/m2/s]
-  */
-  // clang-format on
+
 
   // BAD CONSTANT
   const Real small_value_30 = 1.e-30;
@@ -939,7 +1278,72 @@ void wetdep_resusp_noprecip(const int is_st_cu,
   precabx_new = 0.0;
   precabx_base_new = 0.0;
 }
+
+
 // ==============================================================================
+//   with additional Dana and Hales scavenging coefficient applied.
+//
+// SPECIAL HANDLING:
+//   - Stratiform-cloudborne aerosols: Only affected by stratiform in-cloud 
+//     scavenging; no below-cloud or convective scavenging
+//   - Interstitial aerosols: Affected by convective in-cloud and all 
+//     below-cloud scavenging
+//
+// INPUT PARAMETERS:
+//   is_st_cu            [int]      - Cloud type flag: 1=stratiform, 2=convective
+//   is_strat_cloudborne [bool]     - True if tracer is stratiform-cloudborne aerosol
+//   deltat              [Real, s]  - Model timestep
+//   fracp               [Real, -]  - Fraction of cloud water converted to precip [0-1]
+//   precabx             [Real, kg/m2/s] - Precipitation rate from above the layer
+//   cldv_ik             [Real, -]  - Precipitation area fraction at top interface [0-1]
+//   scavcoef_ik         [Real, 1/mm] - Dana and Hales scavenging coefficient
+//   sol_factb           [Real, -]  - Solubility factor for below-cloud scavenging [0-1]
+//   sol_facti           [Real, -]  - Solubility factor for in-cloud scavenging [0-1]
+//   tracer_1            [Real, kg/kg] - Tracer mixing ratio for in-cloud calc
+//   tracer_2            [Real, kg/kg] - Tracer mixing ratio for below-cloud calc
+//
+// OUTPUT PARAMETERS:
+//   src                 [Real, kg/kg/s] - Total scavenging rate (in-cloud + below-cloud)
+//   fin                 [Real, -]       - Fraction of total scavenging from in-cloud [0-1]
+//
+// PERFORMANCE ESTIMATE:
+//   - Computational complexity: O(1) - simple arithmetic operations
+//   - Memory access: All scalar inputs, minimal memory bandwidth requirement
+//   - Branch divergence: Contains conditional logic based on is_strat_cloudborne 
+//     and is_st_cu, which may cause warp divergence on GPUs if neighboring 
+//     threads have different cloud types
+//   - Estimated FLOPs: ~15-20 floating point operations
+//   - This function is likely memory-bound when called in parallel over many grid points
+//
+// SUGGESTIONS FOR IMPROVEMENT:
+//   1. READABILITY:
+//      - Consider using an enum for is_st_cu instead of magic numbers (1, 2)
+//      - Variable names like 'fin' could be more descriptive (e.g., 'frac_incloud')
+//      - The nested if-else structure could be flattened for clarity
+//
+//   2. RELIABILITY:
+//      - Add assertions or checks for valid input ranges (e.g., fracp in [0,1])
+//      - Consider using named constants for cloud type flags (STRATIFORM=1, CONVECTIVE=2)
+//      - The small_value_36 for avoiding division by zero could mask physics errors
+//
+//   3. EFFICIENCY:
+//      - The division by deltat appears multiple times; could precompute inv_deltat
+//      - Consider restructuring to reduce branch divergence on GPU architectures
+//      - If tracer_1 and tracer_2 are often the same, consider a single input
+//
+//   4. POTENTIAL ISSUES:
+//      - Using 1e-36 is very small and may cause floating point precision issues
+//        on single precision; consider using a larger threshold like 1e-30
+//
+// BUGS/CONCERNS:
+//   - None identified, but the logic assumes is_st_cu is always 1 or 2; 
+//     other values would lead to unexpected behavior (src1=0 for interstitial aerosols)
+//
+// REFERENCES:
+//   - Rogers, R.R. and Yau, M.K.: "A Short Course in Cloud Physics"
+//   - Balkanski, Y.J. et al.: Scavenging ratios for aerosols
+//   - Dana and Hales: Below-cloud scavenging coefficients
+//
 // ==============================================================================
 KOKKOS_INLINE_FUNCTION
 void wetdep_scavenging(const int is_st_cu, const bool is_strat_cloudborne,
@@ -948,39 +1352,7 @@ void wetdep_scavenging(const int is_st_cu, const bool is_strat_cloudborne,
                        const Real sol_factb, const Real sol_facti,
                        const Real tracer_1, const Real tracer_2, Real &src,
                        Real &fin) {
-  // clang-format off
-  // ------------------------------------------------------------------------------
-  // do scavenging for both convective and stratiform
-  //
-  // assuming liquid clouds (no ice)
-  //
-  // set odds proportional to fraction of the grid box that is swept by the
-  // precipitation =precabc/rhoh20*(area of sphere projected on plane
-  //                                /volume of sphere)*deltat
-  // assume the radius of a raindrop is 1 e-3 m from Rogers and Yau,
-  // unless the fraction of the area that is cloud is less than odds, in which
-  // case use the cloud fraction (assumes precabs is in kg/m2/s)
-  // is really: precabs*3/4/1000./1e-3*deltat
-  // here I use .1 from Balkanski
-  // ------------------------------------------------------------------------------
-  /*
-  in :: is_strat_cloudborne   ! if tracer is stratiform-cloudborne aerosol or not
-  in :: is_st_cu ! options for stratiform (1) or convective (2) clouds
 
-  in :: deltat       ! timestep [s]
-  in :: fracp        ! fraction of cloud water converted to precip [fraction]
-  in :: precabx      ! precip from above of the layer [kg/m2/s]
-  in :: cldv_ik      ! precipitation area at the top interface [fraction]
-  in :: scavcoef_ik  ! Dana and Hales coefficient [1/mm]
-  in :: sol_factb    ! solubility factor (frac of aerosol scavenged below cloud) [fraction]
-  in :: sol_facti    ! solubility factor (frac of aerosol scavenged in cloud) [fraction]
-  in :: tracer_1     ! tracer input for calculate src1 [kg/kg]
-  in :: tracer_2     ! tracer input for calculate src2 [kg/kg]
-  out :: src         ! total scavenging (incloud + belowcloud) [kg/kg/s]
-  out :: fin         ! fraction of incloud scavenging [fraction]
-
-  */
-  // clang-format on
   // BAD CONSTANT
   const Real small_value_36 = 1.e-36;
   const Real small_value_5 = 1.e-5; // for cloud fraction
@@ -1017,24 +1389,63 @@ void wetdep_scavenging(const int is_st_cu, const bool is_strat_cloudborne,
   src = src1 + src2; // total stratiform or convective scavenging
   fin = src1 / (src + small_value_36); // fraction taken by incloud processes
 }
+
+
 // =============================================================================
+// FUNCTION: compute_evap_frac
 // =============================================================================
+// PURPOSE:
+//   Calculate the fraction of stratiform precipitation from above that
+//   evaporates within the current atmospheric layer. This is used in
+//   aerosol wet removal calculations to determine how much precipitation
+//   is lost to evaporation before reaching the surface.
+//
+// PHYSICS:
+//   The evaporation fraction is computed as the ratio of evaporated mass
+//   to incoming precipitation mass:
+//     fracevx = (evap_ik * pdel_ik / gravity) / precabx
+//   where the numerator represents the mass of water evaporated per unit
+//   area in this layer, and the denominator is the incoming precipitation
+//   flux from above.
+//
+// -----------------------------------------------------------------------------
+// INPUT PARAMETERS:
+//   mam_prevap_resusp_optcc  - Aerosol resuspension option flag [integer]
+//                              0 = no resuspension (fracevx = 0)
+//                              non-zero = calculate evaporation fraction
+//   pdel_ik                  - Pressure thickness at current column and
+//                              level [Pa]
+//   evap_ik                  - Evaporation rate in this layer [kg/kg/s]
+//   precabx                  - Precipitation flux from above [kg/m2/s]
+//
+// OUTPUT PARAMETERS:
+//   fracevx                  - Fraction of precipitation that evaporates
+//                              in this layer [dimensionless, 0-1]
+//
+// -----------------------------------------------------------------------------
+//
+// PERFORMANCE SUGGESTIONS:
+//   1. The division by gravity is constant - could be pre-computed as
+//      reciprocal (1/gravit) if called frequently in tight loops
+//   2. Consider using fused multiply-add (FMA) operations if available
+//   3. The branch could be eliminated using a mask if vectorization is desired
+//
+// READABILITY/RELIABILITY SUGGESTIONS:
+//   1. Replace magic number "1.e-12" with a named constant (e.g., 
+//      PRECIP_FLOOR_THRESHOLD) with documentation explaining its purpose
+//   2. Add assertion or runtime check for precabx > 0 in debug builds
+//   3. Consider adding units to variable names (e.g., evap_ik_kgkgs)
+//   4. Document the physical meaning of mam_prevap_resusp_optcc values
+//
+// POTENTIAL ISSUES:
+//   - "BAD CONSTANT" comment suggests small_value_12 may need review
+//   - No validation that input values are physically reasonable
+//
+// -----------------------------------------------------------------------------
 KOKKOS_INLINE_FUNCTION
 void compute_evap_frac(const int mam_prevap_resusp_optcc, const Real pdel_ik,
                        const Real evap_ik, const Real precabx, Real &fracevx) {
-  // clang-format off
-  //  ------------------------------------------------------------------------------
-  //  calculate the fraction of strat precip from above
-  //                  which evaporates within this layer
-  //  ------------------------------------------------------------------------------
-  /*
-  in :: mam_prevap_resusp_optcc       ! suspension options
-  in :: pdel_ik       ! pressure thikness at current column and level [Pa]
-  in :: evap_ik       ! evaporation in this layer [kg/kg/s]
-  in :: precabx       ! precipitation from above [kg/m2/s]
-  out :: fracevx      ! fraction of evaporation [fraction]
-  */
-  // clang-format on
+
   // BAD CONSTANT
   const Real small_value_12 = 1.e-12;
   const Real gravit = Constants::gravity;
@@ -1046,8 +1457,90 @@ void compute_evap_frac(const int mam_prevap_resusp_optcc, const Real pdel_ik,
     fracevx = utils::min_max_bound(0., 1., fracevx);
   }
 }
+
+
 // =============================================================================
+// FUNCTION: rain_mix_ratio
 // =============================================================================
+// PURPOSE:
+//   Calculate the rain mixing ratio from the precipitation rate above the
+//   current layer. This function converts precipitation flux [kg/m2/s] to
+//   a mass mixing ratio [kg/kg] using the raindrop fall velocity.
+//
+// PHYSICS:
+//   The rain mixing ratio is derived from the steady-state assumption that
+//   precipitation flux equals the product of rain water content and fall
+//   velocity:
+//     sumppr = rho * rain * vfall
+//   Solving for rain mixing ratio:
+//     rain = sumppr / (rho * vfall)
+//
+//   The fall velocity parameterization follows Tripoli and Cotton (1980),
+//   which accounts for air density dependence:
+//     vfall = convfw / sqrt(rho)
+//   where convfw is calibrated for standard conditions.
+//
+//   Rain is only computed for temperatures above freezing (tmelt); below
+//   freezing, precipitation is assumed to be snow/ice with zero liquid
+//   rain mixing ratio.
+//
+// REFERENCE:
+//   Tripoli, G.J. and W.R. Cotton, 1980: A Numerical Investigation of
+//   Several Factors Contributing to the Observed Variable Intensity of
+//   Deep Convection over South Florida. J. Appl. Meteor., 19, 1037-1063.
+//
+// PROVENANCE:
+//   Extracted from clddiag subroutine for C++ porting by Shuaiqi Tang,
+//   September 22, 2022
+//
+// -----------------------------------------------------------------------------
+// INPUT PARAMETERS:
+//   temperature  - Air temperature at layer midpoint [K]
+//   pmid         - Pressure at layer midpoint [Pa]
+//   sumppr       - Sum of precipitation rate above this layer [kg/m2/s]
+//
+// OUTPUT (RETURN VALUE):
+//   rain         - Mixing ratio of rain water [kg/kg]
+//                  Returns 0 if temperature <= freezing or if computed
+//                  value is below threshold
+//
+// -----------------------------------------------------------------------------
+// COMPUTATIONAL PERFORMANCE ESTIMATE:
+//   - Operations: ~10-15 floating point operations including:
+//     * 1 division (rho calculation)
+//     * 1 square root (vfall calculation)
+//     * 2-3 multiplications/divisions
+//   - Memory: Minimal - only local scalar variables
+//   - Branching: 2 conditionals (temperature check, small value check)
+//   - Expected throughput: Moderate (sqrt is typically the bottleneck)
+//
+// PERFORMANCE SUGGESTIONS:
+//   1. Pre-compute 1/rair if called frequently, as rair is constant
+//   2. Consider using fast approximate sqrt (rsqrt) if available and
+//      precision requirements allow
+//   3. The two branches could potentially be combined or restructured
+//      for better vectorization:
+//        rain = (temperature > tmelt) ? computed_value : 0.0;
+//        rain = (rain >= small_value_14) ? rain : 0.0;
+//   4. convfw computation uses only constants - could be a compile-time
+//      constant (constexpr) to avoid runtime computation
+//
+// READABILITY/RELIABILITY SUGGESTIONS:
+//   1. Replace magic number "1.e-14" with a named constant explaining
+//      its physical significance (e.g., MIN_RAIN_MIXING_RATIO)
+//   2. The constant 2.7e-4 in convfw should be documented (appears to be
+//      a characteristic raindrop diameter or related parameter)
+//   3. Consider adding input validation (e.g., temperature > 0, pmid > 0)
+//   4. Add units to intermediate variable comments for clarity
+//   5. Consider returning a struct or using output parameter for
+//      consistency with other functions in the codebase
+//
+// POTENTIAL ISSUES / BUGS:
+//   1. "BAD CONSTANT" comment on small_value_14 suggests this threshold
+//      may need review - 1e-14 kg/kg is extremely small
+//   2. No check for sumppr < 0 (unphysical negative precipitation)
+//   3. No check for pmid <= 0 which would cause division issues
+// -----------------------------------------------------------------------------
 KOKKOS_INLINE_FUNCTION
 Real rain_mix_ratio(const Real temperature, const Real pmid,
                     const Real sumppr) {
@@ -1092,7 +1585,80 @@ Real rain_mix_ratio(const Real temperature, const Real pmid,
   return rain;
 }
 
+
 // ==============================================================================
+//   precipitation are either retained in the precipitation or resuspended back
+//   into the atmosphere due to evaporation. Three scenarios are handled:
+//     1. Complete resuspension when precipitation rate becomes negligible
+//     2. No resuspension when no evaporation occurs
+//     3. Non-linear partial resuspension during active evaporation
+//
+// ALGORITHM:
+//   1. Initialize output variables with input values
+//   2. Calculate mass of water evaporated (tmpa) from pressure thickness
+//   3. Update precipitation rate after evaporation
+//   4. Branch to appropriate resuspension calculation based on conditions
+//
+// PHYSICAL BASIS:
+//   - When precipitation evaporates, scavenged aerosols can be released back
+//     into the atmosphere (resuspension)
+//   - The amount of resuspension depends on the fraction of precipitation
+//     that evaporates and the cloud type (stratiform vs convective)
+//
+// INPUT PARAMETERS:
+//   is_st_cu              [int]    - Cloud type indicator:
+//                                    1 = stratiform (Marshall-Palmer size distribution)
+//                                    2 = convective (log-normal size distribution)
+//   mam_prevap_resusp_optcc [int]  - Resuspension scheme option flag
+//                                    Controls the resuspension parameterization
+//   pdel_ik               [Real]   - Pressure thickness at current column/level [Pa]
+//   evapx                 [Real]   - Evaporation rate at current layer [kg/kg/s]
+//   precabx_old           [Real]   - Precipitation rate above this layer (input) [kg/m2/s]
+//   precabx_base_old      [Real]   - Precipitation rate at cloud base (input) [kg/m2/s]
+//   scavabx_old           [Real]   - Scavenged tracer flux from above (input) [kg/m2/s]
+//   precnumx_base_old     [Real]   - Precipitation number at cloud base (input) [#/m2/s]
+//
+// OUTPUT PARAMETERS:
+//   precabx_new           [Real&]  - Updated precipitation rate above layer [kg/m2/s]
+//   precabx_base_new      [Real&]  - Updated precipitation rate at cloud base [kg/m2/s]
+//   scavabx_new           [Real&]  - Updated scavenged tracer flux [kg/m2/s]
+//   precnumx_base_new     [Real&]  - Updated precipitation number at cloud base [#/m2/s]
+//   resusp_x              [Real&]  - Aerosol mass resuspension rate [kg/m2/s]
+//
+// PERFORMANCE NOTES:
+//   - Estimated complexity: O(1) - constant time operations
+//   - Contains conditional branches that may affect GPU warp divergence
+//   - Calls to sub-functions (wetdep_resusp_noprecip, wetdep_resusp_nonlinear)
+//     may dominate execution time
+//   - Memory access pattern: All scalar operations, good for cache efficiency
+//
+// PERFORMANCE SUGGESTIONS:
+//   1. Consider branch-free alternatives if warp divergence is significant
+//   2. Profile to determine if inlining sub-functions improves performance
+//   3. The three-way branch could potentially be restructured for better
+//      branch prediction on CPUs
+//
+// READABILITY SUGGESTIONS:
+//   1. Replace magic number 1.e-30 with a named constant at module level
+//   2. Consider using an enum for is_st_cu (STRATIFORM=1, CONVECTIVE=2)
+//   3. Consider using an enum or named constants for mam_prevap_resusp_optcc thresholds
+//   4. Add intermediate variable names to clarify physics (e.g., evaporated_mass = tmpa)
+//   5. Group related input/output parameters in a struct for cleaner interface
+//
+// RELIABILITY SUGGESTIONS:
+//   1. Add assertions or checks for valid is_st_cu values (1 or 2)
+//   2. Validate that mam_prevap_resusp_optcc is within expected range
+//   3. Consider adding bounds checking for negative precipitation rates
+//   4. Document expected ranges for all input parameters
+//
+// POTENTIAL BUGS:
+//   1. resusp_x is not initialized at function entry - if none of the three
+//      branches are taken (which shouldn't happen logically), resusp_x would
+//      be uninitialized. Consider initializing to 0.0 at the start.
+//   2. The condition (mam_prevap_resusp_optcc <= 130) in the no-evap branch
+//      sets scavabx_new = scavabx_old, but scavabx_new is already initialized
+//      to scavabx_old at line ~50, making this assignment redundant.
+//
 // ==============================================================================
 KOKKOS_INLINE_FUNCTION
 void wetdep_resusp(const int is_st_cu, const int mam_prevap_resusp_optcc,
@@ -1101,30 +1667,7 @@ void wetdep_resusp(const int is_st_cu, const int mam_prevap_resusp_optcc,
                    const Real precnumx_base_old, Real &precabx_new,
                    Real &precabx_base_new, Real &scavabx_new,
                    Real &precnumx_base_new, Real &resusp_x) {
-  // clang-format off
-  // ------------------------------------------------------------------------------
-  // do precip production, resuspension and scavenging
-  // ------------------------------------------------------------------------------
-  /*
-  in :: is_st_cu ! options for stratiform (1) or convective (2) clouds
-                      ! raindrop size distribution is
-                      ! different for different cloud:
-                      ! 1: assume marshall-palmer distribution
-                      ! 2: assume log-normal distribution
-  in :: mam_prevap_resusp_optcc       ! suspension options
-  in :: pdel_ik       ! pressure thikness at current column and level [Pa]
-  in :: evapx         ! evaporation at current layer [kg/kg/s]
-  in :: precabx_base_old ! input of precipitation at cloud base [kg/m2/s]
-  in :: precabx_old ! input of precipitation above this layer [kg/m2/s]
-  in :: scavabx_old ! input of scavenged tracer flux from above [kg/m2/s]
-  in :: precnumx_base_old ! input of precipitation number at cloud base [#/m2/s]
-  out :: precabx_base_new ! output of precipitation at cloud base [kg/m2/s]
-  out :: precabx_new ! output of precipitation above this layer [kg/m2/s]
-  out :: scavabx_new ! output of scavenged tracer flux from above [kg/m2/s]
-  out :: precnumx_base_new ! output of precipitation number at cloud base [#/m2/s]
-  out :: resusp_x    ! aerosol mass re-suspension in a particular layer [kg/m2/s]
-  */
-  // clang-format on
+
 
   // BAD CONSTANT
   const Real small_value_30 = 1.e-30;
